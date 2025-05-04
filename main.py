@@ -1,4 +1,5 @@
 import os
+import random
 import signal
 import time
 import asyncio
@@ -62,6 +63,7 @@ LOG_FILE = "bot.log"
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w") as f:
         pass  # Create an empty log file if it doesn't exist
+
 # Set up logging to file
 file_handler = logging.FileHandler(LOG_FILE)
 file_handler.setLevel(logging.INFO)
@@ -81,6 +83,54 @@ class BotStats:
         self.peak_concurrent = 0
         self.download_times = []  # list of seconds
         self.download_speeds = []  # list of bytes/second
+
+    # Persistence support (no separate manager class needed)
+    stats_file = os.path.join(BASE_DIR, "stats.json")
+    global_stats = None     # will hold the single global BotStats
+    user_stats   = {}       # maps user_id -> BotStats instance
+
+    @classmethod
+    def load_all(cls):
+        """Load global + per-user stats from disk into class vars."""
+        try:
+            with open(cls.stats_file, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        # global
+        for k, v in data.get("global", {}).items():
+            setattr(cls.global_stats, k, v)
+        # per-user
+        for uid_str, st in data.get("users", {}).items():
+            bs = BotStats()
+            for k, v in st.items():
+                setattr(bs, k, v)
+            cls.user_stats[int(uid_str)] = bs
+
+    @classmethod
+    def save_all(cls):
+        """Dump current global + per-user stats back to disk."""
+        payload = {
+            "global": vars(cls.global_stats),
+            "users":  { str(uid): vars(bs) for uid, bs in cls.user_stats.items() }
+        }
+        with open(cls.stats_file, "w") as f:
+            json.dump(payload, f)
+
+    @classmethod
+    def record_download(cls, user_id, size, duration, success=True):
+        """
+        Update both the global stats and the specific user's stats,
+        then immediately persist everything.
+        """
+        # global
+        cls.global_stats.add_download(size, duration, success)
+        # per-user
+        if user_id not in cls.user_stats:
+            cls.user_stats[user_id] = BotStats()
+        cls.user_stats[user_id].add_download(size, duration, success)
+        # save out
+        cls.save_all()
 
     def add_download(self, size, duration, success=True):
         self.files_handled += 1
@@ -397,7 +447,7 @@ class DownloadTask:
                 duration = self.end_time - self.start_time
 
                 # Update stats
-                stats.add_download(self.file_size, duration, success=True)
+                BotStats.record_download(self.event.sender_id, self.file_size, duration, success=True)
 
                 # Send completion message
                 await self.send_completion_message(duration)
@@ -407,7 +457,7 @@ class DownloadTask:
         except Exception as e:
             logger.error(f"Download error for {self.filename}: {e}")
             await self.event.respond(f"⚠️ Download failed for {self.filename}: {str(e)}")
-            stats.add_download(0, 0, success=False)
+            BotStats.record_download(self.event.sender_id, 0, 0, success=False)
             return False
 
     async def progress_callback(self, current, total):
@@ -780,7 +830,10 @@ class MediaProcessor:
             return False
 
 # Initialize objects
+# Initialize and load persisted stats
 stats = BotStats()
+BotStats.global_stats = stats
+BotStats.load_all()
 download_manager = DownloadManager()
 
 # Initialize the client
@@ -866,15 +919,37 @@ async def start_command(event):
 
 @client.on(events.NewMessage(pattern='/stats|/status'))
 async def stats_command(event):
-    """Handler for /stats command"""
-
+    """Handler for /stats or /status commands."""
     global all_users
-    # Check if the user is already in the active users list
+
+    # Track active users
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
         save_active_users(all_users)
 
-    # Get the current stats
+    # Admin override: show persistent per-user + global stats
+    ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x}
+    if event.sender_id in ADMIN_IDS:
+        lines = ["📊 Persistent Download Statistics", ""]
+        lines.append("Per‑user stats:")
+        for uid, st in BotStats.user_stats.items():
+            lines.append(
+                f"• User {uid}: handled {st.files_handled}, "
+                f"success {st.successful_downloads}, failed {st.failed_downloads}"
+            )
+        lines.append("")  # spacer
+        gs = BotStats.global_stats
+        success_pct = (gs.successful_downloads / gs.files_handled * 100) if gs.files_handled else 0
+        lines.append("Global stats:")
+        lines.append(
+            f"• Total handled: {gs.files_handled}, "
+            f"success {gs.successful_downloads} ({success_pct:.1f}%), "
+            f"failed {gs.failed_downloads} ({100-success_pct:.1f}%)"
+        )
+        await event.respond("\n".join(lines))
+        return
+
+    # Non-admin: show the existing runtime stats
     uptime = stats.get_uptime()
 
     # Calculate success percentage
@@ -968,12 +1043,12 @@ async def test_command(event):
     """Handler for /test command"""
 
     global all_users
-    # Check if the user is already in the active users list
+    # Track user
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
         save_active_users(all_users)
 
-    # Testing directory access
+    # 1) Directory checks
     directories = {
         "telegram_download_dir": DOWNLOAD_DIR,
         "movies_dir": MOVIES_DIR,
@@ -981,99 +1056,113 @@ async def test_command(event):
         "music_dir": MUSIC_DIR,
         "other_dir": OTHER_DIR
     }
-
     dir_checks = []
     for name, path in directories.items():
         if os.path.exists(path) and os.access(path, os.R_OK | os.W_OK):
-            free_space = shutil.disk_usage(path).free
-            dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free_space)} free)")
+            free = shutil.disk_usage(path).free
+            dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free)} free)")
         else:
             dir_checks.append(f"❌ {name}: NOT ACCESSIBLE")
 
-    # Test internet connection
+    # 2) Internet check
     internet_check = "✅ Internet connection: OK"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://www.google.com", timeout=5) as response:
-                if response.status != 200:
+            async with session.get("https://www.google.com", timeout=5) as resp:
+                if resp.status != 200:
                     internet_check = "❌ Internet connection: Failed (HTTP error)"
-    except Exception:
+    except:
         internet_check = "❌ Internet connection: Failed (connection error)"
 
-    # Test Telethon client
-    telethon_check = "✅ Telethon client: Connected" if client.is_connected() else "❌ Telethon client: Disconnected"
+    # 3) Telethon connection
+    telethon_check = (
+        "✅ Telethon client: Connected"
+        if client.is_connected()
+        else "❌ Telethon client: Disconnected"
+    )
 
-    # Test TMDb API if configured
-    tmdb_check = "✅ TMDb API: Connected"
+    # 4) TMDb API configuration
     if TMDB_API_KEY:
+        tmdb_config_check = "✅ TMDb API: Configured"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"https://api.themoviedb.org/3/configuration?api_key={TMDB_API_KEY}",
                     timeout=5
-                ) as response:
-                    if response.status != 200:
-                        tmdb_check = "❌ TMDb API: Failed (HTTP error)"
-        except Exception:
-            tmdb_check = "❌ TMDb API: Failed (connection error)"
+                ) as resp:
+                    if resp.status != 200:
+                        tmdb_config_check = "❌ TMDb API: Config fetch failed"
+        except:
+            tmdb_config_check = "❌ TMDb API: Connection error"
     else:
-        tmdb_check = "⚠️ TMDb API: Not configured"
+        tmdb_config_check = "⚠️ TMDb API: Not configured"
 
-    # Test TMDb API with a title containing special characters
-    test_title = "What the #$*! Do We (K)now!?"
-    test_year = 2014  # Adjust year as needed
-    tmdb_check = await download_manager.tmdb_search_movie(test_title, test_year)
-
-    if tmdb_check:
-        tmdb_result_message = f"✅ TMDb verification successful for: {test_title}"
+    # 5) Random‑filename TMDb lookup
+    filenames_env = os.getenv('FILENAMES', '')
+    if not filenames_env:
+        filename_section = "⚠️ No FILENAMES set in environment."
     else:
-        tmdb_result_message = f"❌ TMDb verification failed for: {test_title}"
+        # split on commas, strip whitespace and surrounding quotes
+        lines = [
+            name.strip().strip('"')
+            for name in filenames_env.split(',')
+            if name.strip()
+        ]
+        if not lines:
+            filename_section = "⚠️ FILENAMES is empty."
+        else:
+            test_file = random.choice(lines)
+            processor = MediaProcessor(test_file, tmdb_api_key=TMDB_API_KEY)
+            try:
+                lookup = await processor.search_tmdb()
+                filename_section = (
+                    f"🎲 Filename test: `{test_file}`\n"
+                    "```json\n"
+                    f"{lookup}\n"
+                    "```"
+                )
+            except Exception as e:
+                filename_section = f"❌ Error processing `{test_file}`:\n```\n{e}\n```"
 
-    # Test network speed
-    start_time = time.time()
-    file_size = 0
+    # 6) Network speed test
+    start = time.time()
+    size = 0
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png") as response:
-                if response.status == 200:
-                    data = await response.read()
-                    file_size = len(data)
-    except Exception:
+            async with session.get(
+                "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"
+            ) as resp:
+                data = await resp.read() if resp.status == 200 else b''
+                size = len(data)
+    except:
         pass
+    duration = time.time() - start
+    net_speed = humanize.naturalsize(size / duration) + "/s" if duration > 0 else "N/A"
 
-    duration = time.time() - start_time
-    network_speed = file_size / duration if duration > 0 else 0
+    # Build the response
+    msg = ["🔍 SYSTEM TEST RESULTS", ""]
+    msg.append("📁 Directory Checks")
+    msg += dir_checks
+    msg.append("")
+    msg.append("🔧 System Checks")
+    msg.append(internet_check)
+    msg.append(telethon_check)
+    msg.append("")
+    msg.append("🌐 API Connections")
+    msg.append(tmdb_config_check)
+    msg.append(filename_section)
+    msg.append("")
+    msg.append("⚡ Performance")
+    msg.append(f"⚡ Network speed: {net_speed}")
+    msg.append("")
 
-    # Format the message
-    message = "🔍 SYSTEM TEST RESULTS\n\n"
-
-    message += "📁 Directory Checks\n"
-    message += "\n".join(dir_checks)
-    message += "\n\n"
-
-    message += "🔧 System Checks\n"
-    message += f"{internet_check}\n"
-    message += f"{telethon_check}\n"
-    message += "\n"
-
-    message += "🌐 API Connections\n"
-    message += "✅ Telegram Bot API: Connected\n"
-    message += f"{tmdb_check}\n"
-    message += f"{tmdb_result_message}\n"
-    message += "\n"
-
-    message += "⚡ Performance\n"
-    message += f"⚡ Network speed: {humanize.naturalsize(network_speed)}/s\n"
-    message += f"⏱️ API response time: {int(duration * 1000)} ms\n"
-    message += "\n"
-
-    # Overall status
-    if "❌" in message:
-        message += "📊 Overall Status: Some issues detected"
+    # Overall summary
+    if any(line.startswith("❌") for line in msg):
+        msg.append("📊 Overall Status: Some issues detected")
     else:
-        message += "📊 Overall Status: All systems operational"
+        msg.append("📊 Overall Status: All systems operational")
 
-    await event.respond(message)
+    await event.respond("\n".join(msg))
 
 @client.on(events.CallbackQuery(pattern=r'cancel_(\d+)'))
 async def cancel_download_callback(event):
