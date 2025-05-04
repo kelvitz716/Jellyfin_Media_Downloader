@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Telethon session files
+*.session
+*.session-journal
+
+# Jellyfin Bot specific
+jellyfin_bot.session
+jellyfin_bot.session-journal
+Downloads/
+clean_with_guessit.py
+clean_with_ptn.py
+bot.log
+filenames.txt
+sanitized_guessit.txt
+sanitized_ptn.txt
+suggested_improvements.md
