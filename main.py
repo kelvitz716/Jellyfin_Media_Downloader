@@ -19,6 +19,7 @@ from guessit import guessit
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
+from cachetools import TTLCache, cached
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +40,7 @@ TMDB_API_KEY = os.environ.get('TMDB_API_KEY')
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x}
 
 # Base directory for downloads & DB
-BASE_DIR = Path(os.path.expanduser("~/jellyfin"))
+BASE_DIR = Path.home() / "jellyfin"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # TinyDB setup (replaces JSON persistence)
@@ -51,6 +52,9 @@ stats_tbl = db.table("stats")
 # Fuzzy‑matching thresholds
 HIGH_CONFIDENCE = 0.8  # auto‑accept
 LOW_CONFIDENCE  = 0.6  # auto‑reject
+
+# Create a shared cache for TMDb searches: up to 500 entries, TTL 1 hour
+tmdb_cache = TTLCache(maxsize=500, ttl=3600)
 
 # Helper functions
 
@@ -210,16 +214,9 @@ async def shutdown():
         except: pass
     await client.disconnect(); os._exit(0)
 
-# Save_active_users function to update the global all_users
-def save_active_users(users: set[int]):
-    """Persist any new users via TinyDB."""
-    for uid in users:
-        if not users_tbl.contains(where('id') == uid):
-            users_tbl.insert({'id': uid})
-
 # Download Manager
 class DownloadManager:
-    def __init__(self, max_concurrent=3):
+    def __init__(self, max_concurrent=8):
         self.active_downloads = {}  # message_id: DownloadTask
         self.queued_downloads = []  # list of DownloadTask
         self.max_concurrent = max_concurrent
@@ -319,13 +316,16 @@ class DownloadTask:
 
     def get_file_extension(self, filename):
         """
-        Use python-magic to sniff the file’s MIME type (if it exists on disk),
-        then map to a standard extension. Falls back to mimetypes or the original suffix.
+        Determine a file extension:
+        1) If the file already exists on disk, try python-magic.
+        2) If the original filename has a suffix, use that.
+        3) Else try mimetypes.guess_extension.
+        4) Default to .bin.
         """
-        # 1) If we've already downloaded something (partial or full), try magic:
+        dp = getattr(self, "download_path", None)
+        # 1) Use python-magic if the file exists
         try:
-            dp = getattr(self, "download_path", None)
-            if dp and os.path.exists(dp):
+            if dp and Path(dp).exists():
                 mime = magic.from_file(str(dp), mime=True)
                 ext = mimetypes.guess_extension(mime)
                 if ext:
@@ -333,16 +333,20 @@ class DownloadTask:
         except Exception as e:
             logger.warning(f"Magic sniff failed for {dp}: {e}")
 
-        # 2) Fallback: try guessing based on the declared filename
+        # 2) Prefer the original suffix if there is one
+        suffix = Path(filename).suffix
+        if suffix:
+            return suffix
+
+        # 3) Fallback to mimetypes
         guessed_mime, _ = mimetypes.guess_type(filename)
         if guessed_mime:
             ext = mimetypes.guess_extension(guessed_mime)
             if ext:
                 return ext
 
-        # 3) Last resort: preserve any existing suffix, or default to .bin
-        suffix = Path(filename).suffix
-        return suffix if suffix else '.bin'
+        # 4) Ultimate fallback
+        return '.bin'
 
     async def start_download(self):
         self.start_time = time.time()
@@ -545,8 +549,8 @@ class DownloadTask:
                     f"⚠️ Low confidence match ({score:.2f}); defaulting to OTHER"
                 )
                 # Move without renaming
-                dest = os.path.join(target_dir, os.path.basename(self.download_path))
-                shutil.move(self.download_path, dest)
+                dest = target_dir / Path(self.download_path).name
+                shutil.move(self.download_path, str(dest))
                 # Log low‑confidence cases
                 with open(os.path.join(BASE_DIR, 'low_confidence_log.csv'), 'a') as lf:
                     lf.write(f"{self.filename},{parsed},{tmdb_title},{score:.2f}\n")
@@ -563,9 +567,9 @@ class DownloadTask:
             if result:
                 # 2a) Anime goes under Anime/<Title>
                 if result.get('is_anime'):
-                    target_dir = os.path.join(ANIME_DIR, result['title'])
-                    anime_series_dir = target_dir
-                    os.makedirs(anime_series_dir, exist_ok=True)
+                    target_dir = ANIME_DIR
+                    anime_series_dir = target_dir / result['title']
+                    Path(anime_series_dir).mkdir(parents=True, exist_ok=True)
                     await self.update_processing_message(
                         f"✅ Anime detected: {result['title']}\n"
                         f"Created directory: {anime_series_dir}")
@@ -578,11 +582,11 @@ class DownloadTask:
 
                     if folder_struct:
                         # user provided e.g. "My Show/Season 01/"
-                        target_dir = os.path.join(TV_DIR, folder_struct)
+                        target_dir = TV_DIR / folder_struct
                     else:
-                        target_dir = os.path.join(TV_DIR, show_name, f"Season {season_no:02d}")
+                        target_dir = TV_DIR / show_name / f"Season {season_no:02d}"
 
-                    os.makedirs(target_dir, exist_ok=True)
+                    target_dir.mkdir(parents=True, exist_ok=True)
                     await self.update_processing_message(
                         f"✅ TV: {show_name} S{season_no:02d}E{episode_no:02d}"
                     )
@@ -593,8 +597,8 @@ class DownloadTask:
                     year     = result.get('year', '')
                     folder_name = f"{title} ({year})" if year else title
 
-                    target_dir = os.path.join(MOVIES_DIR, folder_name)
-                    os.makedirs(target_dir, exist_ok=True)
+                    target_dir = MOVIES_DIR / folder_name
+                    target_dir.mkdir(parents=True, exist_ok=True)
                     await self.update_processing_message(
                         f"✅ Movie: {title} {f'({year})' if year else ''}"
                     )
@@ -745,45 +749,58 @@ class MediaProcessor:
         logger.info("Detected Movie: %s (%s)", title, year)
         return await self.tmdb_search_movie(title, year)
 
+    @cached(cache=tmdb_cache, key=lambda self, title, year=None: f"movie:{title}:{year}")
     async def tmdb_search_movie(self, title: str, year: int = None) -> dict:
+        """Cached movie lookup."""
         search_url = f"{self.TMDB_URL}/search/movie"
         params = {"query": title, "api_key": self.tmdb_api_key}
         if year:
             params["year"] = year
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, params=params) as resp:
-                data = await resp.json()
+            try:
+                async with session.get(search_url, params=params) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+            except aiohttp.ClientResponseError as e:
+                logger.error(f"TMDb movie search HTTP {e.status}: {e.message}")
+                return {}
+            except aiohttp.ClientError as e:
+                logger.error(f"TMDb movie search network error: {e}")
+                return {}
 
         if not data.get("results"):
             return {}
-
         result = data["results"][0]
         is_anime = await self.check_anime_tag(result["id"], "movie")
-
         return {
             "type": "movie",
             "title": result.get("title", title),
             "year": result.get("release_date", "")[:4],
             "tmdb_id": result["id"],
             "is_anime": is_anime,
-            # ... other fields
         }
 
+    @cached(cache=tmdb_cache, key=lambda self, title, season, episode: f"tv:{title}:{season}:{episode}")
     async def tmdb_search_tv(self, title: str, season: int, episode: int) -> dict:
-        # Existing TV search code
+        """Cached TV lookup."""
         search_url = f"{self.TMDB_URL}/search/tv"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, params={"query": title, "api_key": self.tmdb_api_key}) as resp:
-                results = (await resp.json()).get("results", [])
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url, params={"query": title, "api_key": self.tmdb_api_key}) as resp:
+                    resp.raise_for_status()
+                    results = (await resp.json()).get("results", [])
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"TMDb TV search HTTP {e.status}: {e.message}")
+            return {}
+        except aiohttp.ClientError as e:
+            logger.error(f"TMDb TV search network error: {e}")
+            return {}
 
         if not results:
             return {}
-
         show_id = results[0]["id"]
         is_anime = await self.check_anime_tag(show_id, "tv")
-
-        # Existing episode data retrieval
         return {
             "type": "tv",
             "title": results[0].get("name", title),
@@ -791,7 +808,6 @@ class MediaProcessor:
             "episode": episode,
             "is_anime": is_anime,
             "tmdb_id": show_id,
-            # ... other fields
         }
     
     async def check_anime_tag(self, tmdb_id: int, media_type: str) -> bool:
@@ -999,7 +1015,7 @@ async def test_command(event):
     }
     dir_checks = []
     for name, path in directories.items():
-        if os.path.exists(path) and os.access(path, os.R_OK | os.W_OK):
+        if path.exists() and os.access(path, os.R_OK | os.W_OK):
             free = shutil.disk_usage(path).free
             dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free)} free)")
         else:

@@ -5,3 +5,4 @@ python-dotenv==1.1.0
 tinydb==4.8.2
 guessit==3.2.0
 python-magic==0.4.27
+cachetools==5.5.2
