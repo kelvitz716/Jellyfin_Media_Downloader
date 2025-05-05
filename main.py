@@ -60,6 +60,9 @@ LOW_CONFIDENCE  = 0.6  # auto‑reject
 # Create a shared cache for TMDb searches: up to 500 entries, TTL 1 hour
 tmdb_cache = TTLCache(maxsize=500, ttl=3600)
 
+# Shared HTTP session
+aiohttp_session: aiohttp.ClientSession 
+
 # Helper functions
 
 def load_active_users() -> set[int]:
@@ -536,7 +539,7 @@ class DownloadTask:
         try:
             # Step 1: Analyze file using MediaProcessor
             await self.update_processing_message("Analyzing")
-            processor = MediaProcessor(self.filename, TMDB_API_KEY)
+            processor = MediaProcessor(self.filename, TMDB_API_KEY, session=aiohttp_session)
             result = await processor.search_tmdb()
             logger.info("search_tmdb result → %s", result)
 
@@ -721,13 +724,16 @@ class MediaProcessor:
     """
     TMDB_URL = "https://api.themoviedb.org/3"
 
-    def __init__(self, filename: str, tmdb_api_key: str):
+    def __init__(self, filename: str, tmdb_api_key: str, session: aiohttp.ClientSession = None):
+        """Initializes the MediaProcessor with filename, TMDb API key, and optional session."""
         self.filename = filename
         self.tmdb_api_key = tmdb_api_key
+        # Always reuse the global session if none provided
+        self.session = session or aiohttp_session
 
-    async def fetch_json(self, session: aiohttp.ClientSession, url: str, params: dict) -> dict:
+    async def fetch_json(self, url: str, params: dict) -> dict:
         params["api_key"] = self.tmdb_api_key
-        async with session.get(url, params=params) as resp:
+        async with self.session.get(url, params=params) as resp:
             resp.raise_for_status()
             return await resp.json()
 
@@ -755,23 +761,18 @@ class MediaProcessor:
 
     @cached(cache=tmdb_cache, key=lambda self, title, year=None: f"movie:{title}:{year}")
     async def tmdb_search_movie(self, title: str, year: int = None) -> dict:
-        """Cached movie lookup."""
+        """Cached movie lookup (now sends API key correctly)."""
         search_url = f"{self.TMDB_URL}/search/movie"
-        params = {"query": title, "api_key": self.tmdb_api_key}
+        params = {"query": title}
         if year:
             params["year"] = year
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(search_url, params=params) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-            except aiohttp.ClientResponseError as e:
-                logger.error(f"TMDb movie search HTTP {e.status}: {e.message}")
-                return {}
-            except aiohttp.ClientError as e:
-                logger.error(f"TMDb movie search network error: {e}")
-                return {}
+        try:
+            # fetch_json will inject the api_key param
+            data = await self.fetch_json(search_url, params)
+        except Exception as e:
+            logger.error(f"TMDb movie search error: {e}")
+            return {}
 
         if not data.get("results"):
             return {}
@@ -790,12 +791,10 @@ class MediaProcessor:
         """Cached TV lookup."""
         search_url = f"{self.TMDB_URL}/search/tv"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(search_url, params={"query": title, "api_key": self.tmdb_api_key}) as resp:
-                    resp.raise_for_status()
-                    results = (await resp.json()).get("results", [])
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"TMDb TV search HTTP {e.status}: {e.message}")
+            data = await self.fetch_json(search_url, {"query": title})
+            results = data.get("results", [])
+        except Exception as e:
+            logger.error(f"TMDb TV search error: {e}")
             return {}
         except aiohttp.ClientError as e:
             logger.error(f"TMDb TV search network error: {e}")
@@ -818,12 +817,11 @@ class MediaProcessor:
         """Check if 'anime' exists in TMDb keywords"""
         endpoint = f"{self.TMDB_URL}/{media_type}/{tmdb_id}/keywords"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(endpoint, params={"api_key": self.tmdb_api_key}) as resp:
-                    data = await resp.json()
-                    # Handle both movie and TV keyword formats
-                    keywords = data.get("keywords", []) if media_type == "movie" else data.get("results", [])
-                    return any(k["name"].lower() == "anime" for k in keywords)
+            # fetch_json will add api_key for us
+            data = await self.fetch_json(endpoint, {})
+            # Handle both movie and TV keyword formats
+            keywords = data.get("keywords", []) if media_type == "movie" else data.get("results", [])
+            return any(k["name"].lower() == "anime" for k in keywords)
         except Exception as e:
             logger.error(f"TMDb keyword check failed: {e}")
             return False
@@ -1018,10 +1016,9 @@ async def test_command(event):
     # 2) Internet check
     internet_check = "✅ Internet connection: OK"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://www.google.com", timeout=5) as resp:
-                if resp.status != 200:
-                    internet_check = "❌ Internet connection: Failed (HTTP error)"
+        async with aiohttp_session.get("https://www.google.com", timeout=5) as resp:
+            if resp.status != 200:
+                internet_check = "❌ Internet connection: Failed (HTTP error)"
     except:
         internet_check = "❌ Internet connection: Failed (connection error)"
 
@@ -1036,15 +1033,14 @@ async def test_command(event):
     if TMDB_API_KEY:
         tmdb_config_check = "✅ TMDb API: Configured"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.themoviedb.org/3/configuration?api_key={TMDB_API_KEY}",
-                    timeout=5
-                ) as resp:
-                    if resp.status != 200:
-                        tmdb_config_check = "❌ TMDb API: Config fetch failed"
-        except:
-            tmdb_config_check = "❌ TMDb API: Connection error"
+            async with aiohttp_session.get(
+                f"https://api.themoviedb.org/3/configuration?api_key={TMDB_API_KEY}",
+                timeout=5
+            ) as resp:
+                if resp.status != 200:
+                    tmdb_config_check = "❌ TMDb API: Config fetch failed"
+        except Exception as e:
+            tmdb_config_check = f"❌ TMDb API: Connection error: {e}"
     else:
         tmdb_config_check = "⚠️ TMDb API: Not configured"
 
@@ -1079,12 +1075,12 @@ async def test_command(event):
     start = time.time()
     size = 0
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"
-            ) as resp:
-                data = await resp.read() if resp.status == 200 else b''
-                size = len(data)
+        async with aiohttp_session.get(
+            "https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png",
+            timeout=5
+        ) as resp:
+            data = await resp.read() if resp.status == 200 else b''
+            size = len(data)
     except:
         pass
     duration = time.time() - start
@@ -1227,6 +1223,8 @@ async def handle_media(event):
         )
 
 async def main():
+    global aiohttp_session
+    aiohttp_session = aiohttp.ClientSession()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: signal_handler(s, None))
@@ -1236,7 +1234,11 @@ async def main():
     for uid in load_active_users():
         try: await client.send_message(uid, "🟢 Bot is back online!")
         except: pass
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        # ensure we always close the session
+        await aiohttp_session.close()
 
 async def handle_signal(sig):
     """Async signal handler that calls the main signal handler"""
