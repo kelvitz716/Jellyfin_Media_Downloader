@@ -37,7 +37,11 @@ API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 TMDB_API_KEY = os.environ.get('TMDB_API_KEY')
 # Admin IDs: comma-separated in ENV
-ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x}
+ADMIN_IDS = {
+    int(x.strip().strip('"').strip("'"))
+    for x in os.getenv('ADMIN_IDS', '').split(',')
+    if x.strip().strip('"').strip("'")
+}
 
 # Base directory for downloads & DB
 BASE_DIR = Path.home() / "jellyfin"
@@ -834,6 +838,43 @@ download_manager = DownloadManager()
 # Initialize Telegram client
 client = TelegramClient('jellyfin_bot', API_ID, API_HASH)
 
+def build_queue_message():
+    """
+    Returns (text, buttons) for the current download queue,
+    so both /queue and the cancel callback can share it.
+    """
+    status = download_manager.get_queue_status()
+    active = status["active"]
+    queued = status["queued"]
+
+    # Build text
+    lines = [
+        "📋 DOWNLOAD QUEUE STATUS\n",
+        f"⏳ Active downloads: {len(active)}/{download_manager.max_concurrent}",
+        f"🔄 Queued files: {len(queued)}\n",
+    ]
+    if active:
+        lines.append("🔽 CURRENTLY DOWNLOADING:")
+        for i, (_, fn, prog) in enumerate(active, 1):
+            lines.append(f"{i}️⃣ {fn} ({prog:.0f}% complete)")
+        lines.append("")
+    if queued:
+        lines.append("⏭️ NEXT IN QUEUE:")
+        for i, (_, _, fn, sz) in enumerate(queued, 1):
+            lines.append(f"{i}. {fn} ({humanize.naturalsize(sz)})")
+    lines.append("\n🛑 To cancel: press ❌ next to the file")
+    text = "\n".join(lines)
+
+    # Build buttons
+    buttons = []
+    for msg_id, fn, _ in active:
+        disp = (fn[:20] + "...") if len(fn) > 20 else fn
+        buttons.append([Button.inline(f"❌ Cancel: {disp}", f"cancel_{msg_id}")])
+    for _, msg_id, fn, _ in queued:
+        disp = (fn[:20] + "...") if len(fn) > 20 else fn
+        buttons.append([Button.inline(f"❌ Cancel: {disp}", f"cancel_{msg_id}")])
+
+    return text, buttons
 
 # Handlers
 @client.on(events.NewMessage(pattern='/shutdown'))
@@ -852,15 +893,6 @@ async def shutdown_command(event):
 async def users_command(event):
     total = len(users_tbl.all())
     await event.respond(f"👥 Total users: {total}\nDB: {DB_PATH}")
-
-@client.on(events.NewMessage(pattern='/start|/help'))
-async def start_command(event):
-    if event.sender_id not in all_users:
-        all_users.add(event.sender_id)
-        save_active_users({event.sender_id})
-    await event.respond(
-        "👋 Welcome..."
-    )
 
 @client.on(events.NewMessage(pattern='/start|/help'))
 async def start_command(event):
@@ -957,47 +989,9 @@ async def queue_command(event):
         all_users.add(event.sender_id)
         save_active_users({event.sender_id})
 
-    # Get the queue status
-    queue_status = download_manager.get_queue_status()
-    active_downloads = queue_status["active"]
-    queued_downloads = queue_status["queued"]
-
-    # Build the response message
-    message = "📋 DOWNLOAD QUEUE STATUS\n\n"
-    message += f"⏳ Active downloads: {len(active_downloads)}/{download_manager.max_concurrent}\n"
-    message += f"🔄 Queued files: {len(queued_downloads)}\n\n"
-
-    # Add active downloads
-    if active_downloads:
-        message += "🔽 CURRENTLY DOWNLOADING:\n"
-        for i, (msg_id, filename, progress) in enumerate(active_downloads, 1):
-            message += f"{i}️⃣ {filename} ({progress:.0f}% complete)\n"
-        message += "\n"
-
-    # Add queued downloads
-    if queued_downloads:
-        message += "⏭️ NEXT IN QUEUE:\n"
-        for i, (pos, msg_id, filename, size) in enumerate(queued_downloads, 1):
-            message += f"{i}. {filename} ({humanize.naturalsize(size)})\n"
-
-    message += "\n🛑 To cancel a download: press ❌ next to the file"
-
-    # Create cancel buttons for active downloads
-    buttons = []
-    for msg_id, filename, _ in active_downloads:
-        # Truncate filename if too long
-        display_name = filename[:20] + "..." if len(filename) > 20 else filename
-        buttons.append([Button.inline(f"❌ Cancel: {display_name}", f"cancel_{msg_id}")])
-
-    # Add buttons for queued downloads too
-    for _, msg_id, filename, _ in queued_downloads:
-        display_name = filename[:20] + "..." if len(filename) > 20 else filename
-        buttons.append([Button.inline(f"❌ Cancel: {display_name}", f"cancel_{msg_id}")])
-
-    if buttons:
-        await event.respond(message, buttons=buttons)
-    else:
-        await event.respond(message)
+    text, buttons = build_queue_message()
+    # If there are buttons, send with them; else without
+    await event.respond(text, buttons=buttons if buttons else None)
 
 @client.on(events.NewMessage(pattern='/test'))
 async def test_command(event):
@@ -1125,8 +1119,17 @@ async def test_command(event):
 async def cancel_download_callback(event):
     mid = int(event.data.decode().split('_')[1])
     success = await download_manager.cancel_download(mid)
-    await event.answer("✅ Cancelled" if success else "❌ Not found")
-    await queue_command(event)
+    # Acknowledge the button press
+    await event.answer("✅ Cancelled" if success else "❌ Not found", alert=False)
+
+    # Rebuild and edit the same message that had the queue
+    text, buttons = build_queue_message()
+    try:
+        # For CallbackQuery, event.edit() updates the original message
+        await event.edit(text, buttons=buttons if buttons else None)
+    except Exception:
+        # Fallback: send a fresh message
+        await event.respond(text, buttons=buttons if buttons else None)
 
 @client.on(events.NewMessage)
 async def handle_media(event):
