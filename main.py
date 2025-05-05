@@ -4,15 +4,21 @@ import signal
 import time
 import asyncio
 import logging
-import json
 from datetime import datetime, timedelta
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
+from pathlib import Path
+
+from tinydb import TinyDB, where
+from dotenv import load_dotenv
 import humanize
 import aiohttp
 import shutil
+import magic
+import mimetypes
 from guessit import guessit
-from dotenv import load_dotenv
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
+
+# Load environment variables
 load_dotenv()
 
 # Configure logging
@@ -22,114 +28,117 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot Configuration (should be in a config file)
-API_ID = os.environ.get('API_ID')
+# Bot Configuration
+API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH')
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 TMDB_API_KEY = os.environ.get('TMDB_API_KEY')
+# Admin IDs: comma-separated in ENV
+ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x}
+
+# Base directory for downloads & DB
+BASE_DIR = Path(os.path.expanduser("~/jellyfin"))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+# TinyDB setup (replaces JSON persistence)
+DB_PATH = BASE_DIR / "db.json"
+db = TinyDB(DB_PATH)
+users_tbl = db.table("users")
+stats_tbl = db.table("stats")
+
+# Helper functions
+
+def load_active_users() -> set[int]:
+    """Load active users from TinyDB."""
+    return {row['id'] for row in users_tbl.all()}
+
+
+def save_active_users(users: set[int]):
+    """Persist any new users via TinyDB."""
+    for uid in users:
+        if not users_tbl.contains(where('id') == uid):
+            users_tbl.insert({'id': uid})
+
+
+def admin_only(func):
+    """Decorator to restrict command to admins."""
+    async def wrapper(event):
+        if event.sender_id not in ADMIN_IDS:
+            return await event.respond("⚠️ Permission denied.")
+        return await func(event)
+    return wrapper
 
 # Directory Configuration
-BASE_DIR = os.path.expanduser("~/jellyfin")
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "Downloads")
-MOVIES_DIR = os.path.join(BASE_DIR, "Movies")
-TV_DIR = os.path.join(BASE_DIR, "TV")
-ANIME_DIR = os.path.join(BASE_DIR, "Anime") # Added Anime directory
-MUSIC_DIR = os.path.join(BASE_DIR, "Music")
-OTHER_DIR = os.path.join(BASE_DIR, "Other")
+dirs = ["Downloads", "Movies", "TV", "Anime", "Music", "Other"]
+for sub in dirs:
+    d = BASE_DIR / sub
+    d.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR = BASE_DIR / "Downloads"
+MOVIES_DIR = BASE_DIR / "Movies"
+TV_DIR = BASE_DIR / "TV"
+ANIME_DIR = BASE_DIR / "Anime"
+MUSIC_DIR = BASE_DIR / "Music"
+OTHER_DIR = BASE_DIR / "Other"
 
-# Ensure directories exist
-for directory in [DOWNLOAD_DIR, MOVIES_DIR, TV_DIR, ANIME_DIR, MUSIC_DIR, OTHER_DIR]:
-    os.makedirs(directory, exist_ok=True)
-
-# Movie‐year pattern: title + year between 1900–2099
-MOVIE_YEAR_REGEX = r'(?P<title>.+?)[\.\s_\(\[]+(?P<year>(?:19|20)\d{2})(?=[\.\s_\)\[]|$)'
-
-# Add global shutdown flags
+# Global shutdown flags
 shutdown_in_progress = False
 force_shutdown = False
 last_sigint_time = 0
-FORCE_SHUTDOWN_TIMEOUT = 10  # seconds between consecutive Ctrl+C to force shutdown
+FORCE_SHUTDOWN_TIMEOUT = 10  # seconds
 
-# File paths
-USERS_FILE = os.path.join(BASE_DIR, "active_users.json")
-# Check if the users file exists, if not create it
-if not os.path.exists(USERS_FILE):
-    with open(USERS_FILE, "w") as f:
-        json.dump([], f)  # Create an empty JSON array if it doesn't exist
-
-# Log file
-LOG_FILE = "bot.log"
-# Check if the log file exists, if not create it
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w") as f:
-        pass  # Create an empty log file if it doesn't exist
-
-# Set up logging to file
-file_handler = logging.FileHandler(LOG_FILE)
-file_handler.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
-
-# Bot Stats
+# BotStats class with TinyDB persistence
 class BotStats:
     def __init__(self):
         self.start_time = datetime.now()
         self.files_handled = 0
         self.successful_downloads = 0
         self.failed_downloads = 0
-        self.total_data = 0  # in bytes
+        self.total_data = 0
         self.peak_concurrent = 0
-        self.download_times = []  # list of seconds
-        self.download_speeds = []  # list of bytes/second
+        self.download_times = []
+        self.download_speeds = []
 
-    # Persistence support (no separate manager class needed)
-    stats_file = os.path.join(BASE_DIR, "stats.json")
-    global_stats = None     # will hold the single global BotStats
-    user_stats   = {}       # maps user_id -> BotStats instance
+    global_stats = None
+    user_stats = {}
 
     @classmethod
     def load_all(cls):
-        """Load global + per-user stats from disk into class vars."""
-        try:
-            with open(cls.stats_file, "r") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return
-        # global
-        for k, v in data.get("global", {}).items():
-            setattr(cls.global_stats, k, v)
-        # per-user
-        for uid_str, st in data.get("users", {}).items():
+        """Load stats from TinyDB into memory."""
+        # Global
+        gs = stats_tbl.get(where('type') == 'global')
+        if gs:
+            for k, v in gs.items():
+                if k != 'type': setattr(cls.global_stats, k, v)
+        # Per-user
+        for row in stats_tbl.search(where('type').matches(r'^user_\d+$')):
+            uid = int(row['type'].split('_',1)[1])
             bs = BotStats()
-            for k, v in st.items():
-                setattr(bs, k, v)
-            cls.user_stats[int(uid_str)] = bs
+            for k, v in row.items():
+                if k not in ('type',): setattr(bs, k, v)
+            cls.user_stats[uid] = bs
 
     @classmethod
     def save_all(cls):
-        """Dump current global + per-user stats back to disk."""
-        payload = {
-            "global": vars(cls.global_stats),
-            "users":  { str(uid): vars(bs) for uid, bs in cls.user_stats.items() }
-        }
-        with open(cls.stats_file, "w") as f:
-            json.dump(payload, f)
+        """Persist stats from memory to TinyDB."""
+        # Global
+        gs = vars(cls.global_stats).copy()
+        gs['type'] = 'global'
+        gs.pop('start_time', None)
+        stats_tbl.upsert(gs, where('type') == 'global')
+        # Per-user
+        for uid, bs in cls.user_stats.items():
+            doc = vars(bs).copy()
+            doc['type'] = f'user_{uid}'
+            doc.pop('start_time', None)
+            stats_tbl.upsert(doc, where('type') == f'user_{uid}')
 
     @classmethod
     def record_download(cls, user_id, size, duration, success=True):
-        """
-        Update both the global stats and the specific user's stats,
-        then immediately persist everything.
-        """
-        # global
+        """Update in-memory and persist."""
         cls.global_stats.add_download(size, duration, success)
-        # per-user
         if user_id not in cls.user_stats:
             cls.user_stats[user_id] = BotStats()
         cls.user_stats[user_id].add_download(size, duration, success)
-        # save out
         cls.save_all()
 
     def add_download(self, size, duration, success=True):
@@ -150,161 +159,53 @@ class BotStats:
         return datetime.now() - self.start_time
 
     def get_average_speed(self):
-        if not self.download_speeds:
-            return 0
-        return sum(self.download_speeds) / len(self.download_speeds)
+        return (sum(self.download_speeds) / len(self.download_speeds)) if self.download_speeds else 0
 
     def get_average_time(self):
-        if not self.download_times:
-            return 0
-        return sum(self.download_times) / len(self.download_times)
-    
-# Signal handlers for graceful shutdown
+        return (sum(self.download_times) / len(self.download_times)) if self.download_times else 0
+
+# Signal handlers
 def signal_handler(sig, frame):
     global shutdown_in_progress, force_shutdown, last_sigint_time
-    current_time = time.time()
-    
+    now = time.time()
     if sig == signal.SIGINT:
-        if current_time - last_sigint_time < FORCE_SHUTDOWN_TIMEOUT:
-            logger.warning("Second interrupt received within timeout. Forcing immediate shutdown!")
-            force_shutdown = True
-            os._exit(1)  # Force exit without cleanup
-        else:
-            last_sigint_time = current_time
-            if not shutdown_in_progress:
-                logger.info("Interrupt received, initiating graceful shutdown...")
-                shutdown_in_progress = True
-                asyncio.create_task(shutdown())
-            else:
-                logger.info("Shutdown already in progress. Press Ctrl+C again within 10 seconds for forced exit.")
+        if now - last_sigint_time < FORCE_SHUTDOWN_TIMEOUT:
+            force_shutdown = True; os._exit(1)
+        last_sigint_time = now
+        if not shutdown_in_progress:
+            shutdown_in_progress = True
+            asyncio.create_task(shutdown())
 
 async def shutdown():
-    """Perform graceful shutdown of the bot"""
-    global shutdown_in_progress, force_shutdown, all_users
-    
-    if force_shutdown:
-        logger.warning("Forced shutdown initiated!")
-        return
-        
-    logger.info("Starting graceful shutdown sequence...")
-    
-    try:
-        # 1. Stop accepting new downloads
-        download_manager.accepting_new_downloads = False
-        
-        # 2. Notify users about shutdown
-        shutdown_message = "🔄 Bot is shutting down for maintenance. Currently queued downloads will be completed."
-        current_active_users = set()
-        for task in list(download_manager.active_downloads.values()):
-            try:
-                current_active_users.add(task.event.sender_id)
-                await task.event.respond(shutdown_message)
-            except Exception as e:
-                logger.error(f"Failed to notify user about shutdown: {e}")
-        
-        # 3. Wait for active downloads to complete (with timeout)
-        if download_manager.active_downloads:
-            logger.info(f"Waiting for {len(download_manager.active_downloads)} active downloads to complete...")
-            try:
-                # Wait up to 5 minutes for downloads to complete
-                for _ in range(30):  # 30 x 10 seconds = 5 minutes
-                    if force_shutdown or not download_manager.active_downloads:
-                        break
-                    await asyncio.sleep(10)
-                    logger.info(f"Still waiting for {len(download_manager.active_downloads)} downloads...")
-            except Exception as e:
-                logger.error(f"Error while waiting for downloads to complete: {e}")
-        
-        # 4. Cancel any remaining downloads
-        remaining_downloads = list(download_manager.active_downloads.values())
-        for task in remaining_downloads:
-            try:
-                logger.info(f"Cancelling download: {task.filename}")
-                await task.cancel()
-            except Exception as e:
-                logger.error(f"Error cancelling download: {e}")
-
-        # 5. Send final offline notification
-        final_message = "🔴 Bot is now offline. Thank you for using our service!"
-        try:
-            # Send to all users who have ever interacted with the bot, not just current session
-            for user_id in all_users:
-                await client.send_message(user_id, final_message)
-
-            # Save all users for next startup (using the global all_users set)
-            save_active_users(all_users)
-        except Exception as e:
-            logger.error(f"Error sending final shutdown message: {e}")
-        
-        # 6. Final cleanup and disconnect
-        logger.info("Disconnecting client...")
-        await client.disconnect()
-        logger.info("Shutdown complete")
-        
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
-    finally:
-        # Ensure the program exits
-        os._exit(0)
+    """Graceful shutdown."""
+    global shutdown_in_progress, force_shutdown
+    if force_shutdown: return
+    download_manager.accepting_new_downloads = False
+    # Notify active downloads
+    msg = "🔄 Bot is shutting down. Queued tasks will complete."
+    for task in list(download_manager.active_downloads.values()):
+        try: await task.event.respond(msg)
+        except: pass
+    # Wait up to 5m
+    for _ in range(30):
+        if force_shutdown or not download_manager.active_downloads: break
+        await asyncio.sleep(10)
+    # Cancel rest
+    for task in list(download_manager.active_downloads.values()):
+        await task.cancel()
+    # Final offline notice
+    final = "🔴 Bot is now offline. Thank you!"
+    for uid in all_users:
+        try: await client.send_message(uid, final)
+        except: pass
+    await client.disconnect(); os._exit(0)
 
 # Save_active_users function to update the global all_users
-def save_active_users(users):
-    """Save active users to file"""
-    global all_users
-    
-    # Ensure all_users is updated with any new users
-    all_users.update(users)
-    
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump(list(all_users), f)
-    except Exception as e:
-        logger.error(f"Failed to save active users: {e}")
-
-# Add a function to explicitly save the all_users set to file
-def save_all_users_to_file():
-    """Save the global all_users set to file"""
-    global all_users
-    try:
-        with open(USERS_FILE, 'w') as f:
-            json.dump(list(all_users), f)
-        logger.info(f"Saved {len(all_users)} users to file")
-    except Exception as e:
-        logger.error(f"Failed to save all users to file: {e}")
-
-# Add a periodic user save function
-async def periodic_user_save():
-    """Save the user list to file every hour"""
-    while not shutdown_in_progress:
-        try:
-            # Save all users to file
-            save_all_users_to_file()
-            # Wait for an hour
-            await asyncio.sleep(3600)  # 3600 seconds = 1 hour
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Error in periodic user save: {e}")
-            await asyncio.sleep(60)  # Wait a minute before retrying
-
-# Load active users from file
-def load_active_users():
-    """Load active users from file"""
-    try:
-        with open(USERS_FILE, 'r') as f:
-            return set(json.load(f))
-    except Exception as e:
-        logger.error(f"Failed to load active users: {e}")
-        return set()
-    
-# Initialize the global set:
-all_users = load_active_users()
-
-
-def save_all_users():
-    """Save all users to a global variable"""
-    global all_users
-    all_users = load_active_users()
+def save_active_users(users: set[int]):
+    """Persist any new users via TinyDB."""
+    for uid in users:
+        if not users_tbl.contains(where('id') == uid):
+            users_tbl.insert({'id': uid})
 
 # Download Manager
 class DownloadManager:
@@ -383,6 +284,7 @@ class DownloadTask:
         self.client = client
         self.event = event
         self.message_id = message_id
+        self.download_path = os.path.join(DOWNLOAD_DIR, filename)
         self.ext = self.get_file_extension(filename)
         self.filename = filename if filename.endswith(self.ext) else f"{filename}{self.ext}"
         self.file_size = file_size
@@ -406,17 +308,31 @@ class DownloadTask:
         logger.info(f"File {filename} size: {humanize.naturalsize(file_size)}, classified as {'large' if self.large_file else 'regular'} file")
 
     def get_file_extension(self, filename):
-        # Check the mime type or other indicators to determine the extension
-        if filename.endswith('.mp4'):
-            return '.mp4'
-        elif filename.endswith('.avi'):
-            return '.avi'
-        elif filename.endswith('.flv'):
-            return '.flv'
-        elif filename.endswith('.mov'):
-            return '.mov'
-        # Add more formats as needed
-        return '.mkv'  # Default to .mkv
+        """
+        Use python-magic to sniff the file’s MIME type (if it exists on disk),
+        then map to a standard extension. Falls back to mimetypes or the original suffix.
+        """
+        # 1) If we've already downloaded something (partial or full), try magic:
+        try:
+            dp = getattr(self, "download_path", None)
+            if dp and os.path.exists(dp):
+                mime = magic.from_file(str(dp), mime=True)
+                ext = mimetypes.guess_extension(mime)
+                if ext:
+                    return ext
+        except Exception as e:
+            logger.warning(f"Magic sniff failed for {dp}: {e}")
+
+        # 2) Fallback: try guessing based on the declared filename
+        guessed_mime, _ = mimetypes.guess_type(filename)
+        if guessed_mime:
+            ext = mimetypes.guess_extension(guessed_mime)
+            if ext:
+                return ext
+
+        # 3) Last resort: preserve any existing suffix, or default to .bin
+        suffix = Path(filename).suffix
+        return suffix if suffix else '.bin'
 
     async def start_download(self):
         self.start_time = time.time()
@@ -829,65 +745,42 @@ class MediaProcessor:
             logger.error(f"TMDb keyword check failed: {e}")
             return False
 
-# Initialize objects
-# Initialize and load persisted stats
+# Initialize in-memory state & objects
+all_users = load_active_users()
 stats = BotStats()
 BotStats.global_stats = stats
 BotStats.load_all()
 download_manager = DownloadManager()
 
-# Initialize the client
+# Initialize Telegram client
 client = TelegramClient('jellyfin_bot', API_ID, API_HASH)
 
 
-# Add shutdown command handler
+# Handlers
 @client.on(events.NewMessage(pattern='/shutdown'))
+@admin_only
 async def shutdown_command(event):
-    """Handler for /shutdown command - admin only"""
-    # Simple admin check - you might want to replace this with your own logic
-    ADMIN_IDS = [int(id) for id in os.environ.get('ADMIN_IDS', '').split(',') if id]
-    
-    if not ADMIN_IDS:
-        await event.respond("⚠️ No admin IDs configured. Shutdown command disabled.")
-        return
-        
-    if event.sender_id not in ADMIN_IDS:
-        await event.respond("⚠️ You don't have permission to shut down the bot.")
-        return
-    
+    """Admin shutdown."""
     global shutdown_in_progress
     if shutdown_in_progress:
-        await event.respond("⚠️ Shutdown already in progress.")
-        return
-        
-    await event.respond("🔄 Initiating graceful shutdown. Bot will complete current downloads before exiting.")
+        return await event.respond("⚠️ Shutdown in progress.")
+    await event.respond("🔄 Graceful shutdown initiated.")
     shutdown_in_progress = True
     asyncio.create_task(shutdown())
 
-# Add an admin command to view user count
 @client.on(events.NewMessage(pattern='/users'))
+@admin_only
 async def users_command(event):
-    """Handler for /users command - admin only"""
-    # Simple admin check - you might want to replace this with your own logic
-    ADMIN_IDS = [int(id) for id in os.environ.get('ADMIN_IDS', '').split(',') if id]
-    
-    if not ADMIN_IDS:
-        await event.respond("⚠️ No admin IDs configured. Users command disabled.")
-        return
-        
-    if event.sender_id not in ADMIN_IDS:
-        await event.respond("⚠️ You don't have permission to view user statistics.")
-        return
-    
-    global all_users
-    
-    # Force save current users
-    save_all_users_to_file()
-    
+    total = len(users_tbl.all())
+    await event.respond(f"👥 Total users: {total}\nDB: {DB_PATH}")
+
+@client.on(events.NewMessage(pattern='/start|/help'))
+async def start_command(event):
+    if event.sender_id not in all_users:
+        all_users.add(event.sender_id)
+        save_active_users({event.sender_id})
     await event.respond(
-        f"👥 User Statistics\n\n"
-        f"Total unique users: {len(all_users)}\n"
-        f"User IDs are saved in: {USERS_FILE}"
+        "👋 Welcome..."
     )
 
 @client.on(events.NewMessage(pattern='/start|/help'))
@@ -919,16 +812,9 @@ async def start_command(event):
 
 @client.on(events.NewMessage(pattern='/stats|/status'))
 async def stats_command(event):
-    """Handler for /stats or /status commands."""
-    global all_users
-
-    # Track active users
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
-        save_active_users(all_users)
-
-    # Admin override: show persistent per-user + global stats
-    ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x}
+        save_active_users({event.sender_id})
     if event.sender_id in ADMIN_IDS:
         lines = ["📊 Persistent Download Statistics", ""]
         lines.append("Per‑user stats:")
@@ -988,13 +874,9 @@ async def stats_command(event):
 
 @client.on(events.NewMessage(pattern='/queue'))
 async def queue_command(event):
-    """Handler for /queue command"""
-
-    global all_users
-    # Check if the user is already in the active users list
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
-        save_active_users(all_users)
+        save_active_users({event.sender_id})
 
     # Get the queue status
     queue_status = download_manager.get_queue_status()
@@ -1040,13 +922,9 @@ async def queue_command(event):
 
 @client.on(events.NewMessage(pattern='/test'))
 async def test_command(event):
-    """Handler for /test command"""
-
-    global all_users
-    # Track user
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
-        save_active_users(all_users)
+        save_active_users({event.sender_id})
 
     # 1) Directory checks
     directories = {
@@ -1166,30 +1044,17 @@ async def test_command(event):
 
 @client.on(events.CallbackQuery(pattern=r'cancel_(\d+)'))
 async def cancel_download_callback(event):
-    """Handle cancellation button clicks"""
-    message_id = int(event.data.decode('utf-8').split('_')[1])
-    success = await download_manager.cancel_download(message_id)
-
-    if success:
-        await event.answer("Download cancelled successfully")
-    else:
-        await event.answer("Could not find the download task")
-
-    # Update the queue message
+    mid = int(event.data.decode().split('_')[1])
+    success = await download_manager.cancel_download(mid)
+    await event.answer("✅ Cancelled" if success else "❌ Not found")
     await queue_command(event)
 
 @client.on(events.NewMessage)
 async def handle_media(event):
-    """Handle incoming media messages"""
-    # Check if this is a media message
-    if not event.message.media:
-        return
-    
-    global all_users
-    # Check if the user is already in the active users list
+    if not event.message.media: return
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
-        save_active_users(all_users)
+        save_active_users({event.sender_id})
 
     # Get file info
     filename = None
@@ -1280,46 +1145,16 @@ async def handle_media(event):
         )
 
 async def main():
-    # Register signal handlers
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(
-            sig, 
-            lambda s=sig: asyncio.create_task(
-                handle_signal(s)
-            )
-        )
-
-    # Start the client
+        loop.add_signal_handler(sig, lambda s=sig: signal_handler(s, None))
     await client.start(bot_token=BOT_TOKEN)
-
-    # Log startup
     logger.info("Bot started")
-
-    # Start periodic user save task
-    user_save_task = asyncio.create_task(periodic_user_save())
-
-    # Notify previous users about bot restart
-    previous_users = load_active_users()
-    if previous_users:
-        startup_message = (
-            "🟢 Bot is back online and ready!\n\n"
-            "Send me any media file and I will download it to your Jellyfin library.\n"
-            "Use /help to see available commands."
-        )
-        for user_id in previous_users:
-            try:
-                await client.send_message(user_id, startup_message)
-            except Exception as e:
-                logger.error(f"Failed to send startup message to user {user_id}: {e}")
-
-
-    # Run the client until disconnected
-    try:
-        await client.run_until_disconnected()
-    finally:
-        # Cancel the periodic save task when disconnected
-        user_save_task.cancel()
+    # Optional: notify previous users
+    for uid in load_active_users():
+        try: await client.send_message(uid, "🟢 Bot is back online!")
+        except: pass
+    await client.run_until_disconnected()
 
 async def handle_signal(sig):
     """Async signal handler that calls the main signal handler"""
