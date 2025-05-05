@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import signal
 import time
 import asyncio
@@ -15,6 +16,7 @@ import shutil
 import magic
 import mimetypes
 from guessit import guessit
+from difflib import SequenceMatcher
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
 
@@ -46,6 +48,10 @@ db = TinyDB(DB_PATH)
 users_tbl = db.table("users")
 stats_tbl = db.table("stats")
 
+# Fuzzy‑matching thresholds
+HIGH_CONFIDENCE = 0.8  # auto‑accept
+LOW_CONFIDENCE  = 0.6  # auto‑reject
+
 # Helper functions
 
 def load_active_users() -> set[int]:
@@ -67,6 +73,10 @@ def admin_only(func):
             return await event.respond("⚠️ Permission denied.")
         return await func(event)
     return wrapper
+
+def similarity(a: str, b: str) -> float:
+    """Return a ratio [0.0–1.0] of how similar two strings are."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 # Directory Configuration
 dirs = ["Downloads", "Movies", "TV", "Anime", "Music", "Other"]
@@ -522,6 +532,33 @@ class DownloadTask:
             result = await processor.search_tmdb()
             logger.info("search_tmdb result → %s", result)
 
+            # ─── Fuzzy‑match check ────────────────────────────────────────────────
+            parsed     = guessit(self.filename).get('title', '')
+            tmdb_title = result.get('title', '')
+            score      = similarity(parsed, tmdb_title)
+            logger.info("Fuzzy match '%s' vs. '%s' → %.2f", parsed, tmdb_title, score)
+
+            if score < LOW_CONFIDENCE:
+                # Low confidence → fallback to Other
+                target_dir = OTHER_DIR
+                await self.update_processing_message(
+                    f"⚠️ Low confidence match ({score:.2f}); defaulting to OTHER"
+                )
+                # Move without renaming
+                dest = os.path.join(target_dir, os.path.basename(self.download_path))
+                shutil.move(self.download_path, dest)
+                # Log low‑confidence cases
+                with open(os.path.join(BASE_DIR, 'low_confidence_log.csv'), 'a') as lf:
+                    lf.write(f"{self.filename},{parsed},{tmdb_title},{score:.2f}\n")
+                return
+
+            elif score < HIGH_CONFIDENCE:
+                # Medium confidence → proceed but warn
+                await self.update_processing_message(
+                    f"⚠️ Medium confidence ({score:.2f}); proceeding with caution"
+                )
+            # ───────────────────────────────────────────────────────────────────────
+            
             # Step 2: Decide where to put it
             if result:
                 # 2a) Anime goes under Anime/<Title>
@@ -573,6 +610,32 @@ class DownloadTask:
                 await self.update_processing_message(
                     "⚠️ No TMDb match found; defaulting to OTHER"
                 )
+
+
+            # ─── Rename for high‑confidence matches ───────────────────────────────
+            if score >= HIGH_CONFIDENCE:
+                ext = os.path.splitext(self.download_path)[1]
+                # Build Jellyfin‑friendly base name
+                if result.get('is_anime'):
+                    base = f"{result['title']} - Episode {result.get('episode', '')}"
+                elif result.get('type') == 'tv':
+                    season  = result.get('season', 0)
+                    episode = result.get('episode', 0)
+                    base = f"{result['title']} - S{season:02d}E{episode:02d}"
+                elif result.get('type') == 'movie':
+                    year = result.get('year', '')
+                    base = f"{result['title']} ({year})"
+                else:
+                    base = os.path.splitext(self.filename)[0]
+                # Sanitize file name
+                safe_base = re.sub(r'[\\/:"*?<>|]+', '', base)
+                new_name = f"{safe_base}{ext}"
+                # Rename on disk and update path
+                new_path = os.path.join(os.path.dirname(self.download_path), new_name)
+                os.rename(self.download_path, new_path)
+                self.download_path = new_path
+            # ────────────────────────────────────────────────────────────────────────
+
 
             # Step 3: Move file into place
             await self.update_processing_message("Moving to library")
