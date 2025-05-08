@@ -13,3 +13,4 @@ bot.log
 filenames.txt
 sanitized_*.txt
 suggested_improvements.md
+data/jellyfin/

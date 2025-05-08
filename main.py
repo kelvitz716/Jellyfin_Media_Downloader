@@ -527,13 +527,13 @@ class DownloadTask:
         self.cancelled = True
 
         # Delete the partially downloaded file if it exists
-        if os.path.exists(self.download_path):
+        if Path(self.download_path).exists():
             try:
-                os.remove(self.download_path)
+                Path(self.download_path).unlink()
             except Exception as e:
                 logger.error(f"Failed to remove file during cancellation: {e}")
 
-        # Send cancellation message
+       # Send cancellation message (event.respond expects string paths)
         await self.event.respond(
             f"⚠️ Cancellation requested for {self.filename}\n"
             f"❌ Download cancelled for {self.filename}\n"
@@ -650,9 +650,9 @@ class DownloadTask:
 
             # ─── Rename for high‑confidence matches ───────────────────────────────
             if score >= HIGH_CONFIDENCE:
-                ext = os.path.splitext(self.download_path)[1]
-                # Build Jellyfin‑friendly base name
-                if result.get('is_anime'):
+                ext = Path(self.download_path).suffix # Use Path.suffix
+                # Build Jellyfin‑friendly base name (consistent with organization logic)
+                if result.get('is_anime') and result.get('type') == 'tv':
                     base = f"{result['title']} - Episode {result.get('episode', '')}"
                 elif result.get('type') == 'tv':
                     season  = result.get('season', 0)
@@ -665,9 +665,9 @@ class DownloadTask:
                     base = os.path.splitext(self.filename)[0]
                 # Sanitize file name
                 safe_base = re.sub(r'[\\/:"*?<>|]+', '', base)
-                new_name = f"{safe_base}{ext}"
-                # Rename on disk and update path
-                new_path = os.path.join(os.path.dirname(self.download_path), new_name)
+                new_name_str = f"{safe_base}{ext}"
+                # Rename on disk and update path using Path
+                new_path = Path(self.download_path).parent / new_name_str
                 os.rename(self.download_path, new_path)
                 self.download_path = new_path
             # ────────────────────────────────────────────────────────────────────────
@@ -676,11 +676,11 @@ class DownloadTask:
             # Step 3: Move file into place
             await self.update_processing_message("Moving to library")
             safe_name = Path(self.download_path).name
-            dest_path = target_dir / safe_name
-            if os.path.exists(dest_path):
+            dest_path: Path = target_dir / safe_name
+            if dest_path.exists():
                 base, ext = os.path.splitext(dest_path)
                 dest_path = f"{base}_{int(time.time())}{ext}"
-            shutil.move(self.download_path, dest_path)
+            shutil.move(str(Path(self.download_path)), str(dest_path)) # shutil may require strings
 
             processing_time = time.time() - self.end_time
             await self.update_processing_message(
@@ -784,9 +784,12 @@ class MediaProcessor:
         logger.info("Detected Movie: %s (%s)", title, year)
         return await self.tmdb_search_movie(title, year)
 
-    @cached(cache=tmdb_cache, key=lambda self, title, year=None: f"movie:{title}:{year}")
     async def tmdb_search_movie(self, title: str, year: int = None) -> dict:
         """Cached movie lookup (now sends API key correctly)."""
+        key = f"movie:{title}:{year}"
+        if key in tmdb_cache:
+            return tmdb_cache[key]
+        
         search_url = f"{self.TMDB_URL}/search/movie"
         params = {"query": title}
         if year:
@@ -799,21 +802,30 @@ class MediaProcessor:
             logger.error(f"TMDb movie search error: {e}")
             return {}
 
-        if not data.get("results"):
-            return {}
-        result = data["results"][0]
-        is_anime = await self.check_anime_tag(result["id"], "movie")
-        return {
-            "type": "movie",
-            "title": result.get("title", title),
-            "year": result.get("release_date", "")[:4],
-            "tmdb_id": result["id"],
-            "is_anime": is_anime,
-        }
+        else:
+            if data.get("results"):
+                first = data["results"][0]
+                is_anime = await self.check_anime_tag(first["id"], "movie")
+                result = {
+                    "type": "movie",
+                    "title": first.get("title", title),
+                    "year": first.get("release_date", "")[:4],
+                    "tmdb_id": first["id"],
+                    "is_anime": is_anime,
+                }
+            else:
+                result = {}
 
-    @cached(cache=tmdb_cache, key=lambda self, title, season, episode: f"tv:{title}:{season}:{episode}")
+        tmdb_cache[key] = result
+        return result
+
+    
     async def tmdb_search_tv(self, title: str, season: int, episode: int) -> dict:
         """Cached TV lookup."""
+        key = f"tv:{title}:{season}:{episode}"
+        if key in tmdb_cache:
+            return tmdb_cache[key]
+        
         search_url = f"{self.TMDB_URL}/search/tv"
         try:
             data = await self.fetch_json(search_url, {"query": title})
@@ -824,19 +836,24 @@ class MediaProcessor:
         except aiohttp.ClientError as e:
             logger.error(f"TMDb TV search network error: {e}")
             return {}
+        
+        else:
+            if data.get("results"): 
+                show_id = results[0]["id"]
+                is_anime = await self.check_anime_tag(show_id, "tv")
+                return {
+                    "type": "tv",
+                    "title": results[0].get("name", title),
+                    "season": season,
+                    "episode": episode,
+                    "is_anime": is_anime,
+                    "tmdb_id": show_id,
+                }
+            else:
+                result = {}
 
-        if not results:
-            return {}
-        show_id = results[0]["id"]
-        is_anime = await self.check_anime_tag(show_id, "tv")
-        return {
-            "type": "tv",
-            "title": results[0].get("name", title),
-            "season": season,
-            "episode": episode,
-            "is_anime": is_anime,
-            "tmdb_id": show_id,
-        }
+        tmdb_cache[key] = result
+        return result
     
     async def check_anime_tag(self, tmdb_id: int, media_type: str) -> bool:
         """Check if 'anime' exists in TMDb keywords"""
@@ -1027,15 +1044,15 @@ async def test_command(event):
     directories = {
         "telegram_download_dir": DOWNLOAD_DIR,
         "movies_dir": MOVIES_DIR,
-        "tv_dir": TV_DIR,
+        "tv_dir": TV_DIR, # Changed from music_dir to tv_dir
         "music_dir": MUSIC_DIR,
         "other_dir": OTHER_DIR
     }
     dir_checks = []
     for name, path in directories.items():
-        if path.exists() and os.access(path, os.R_OK | os.W_OK):
+        if path.exists() and path.access(os.R_OK | os.W_OK):
             free = shutil.disk_usage(path).free
-            dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free)} free)")
+            dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free)} free)") # Use humanize
         else:
             dir_checks.append(f"❌ {name}: NOT ACCESSIBLE")
 
