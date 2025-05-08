@@ -585,12 +585,26 @@ class DownloadTask:
             if result:
                 # 2a) Anime goes under Anime/<Title>
                 if result.get('is_anime'):
-                    target_dir = ANIME_DIR
-                    anime_series_dir = target_dir / result['title']
-                    Path(anime_series_dir).mkdir(parents=True, exist_ok=True)
+                    # Treat anime like TV or Movie, but rooted under ANIME_DIR
+                    if result['type'] == 'tv':
+                        show  = result['title']
+                        season = result['season']
+                        # e.g. /data/.../Anime/My Anime/Season 01
+                        target_dir = ANIME_DIR / show / f"Season {season:02d}"
+                    elif result['type'] == 'movie':
+                        title = result['title']
+                        year  = result.get('year', '')
+                        # e.g. /data/.../Anime/My Anime Movie (2023)
+                        folder = f"{title} ({year})" if year else title
+                        target_dir = ANIME_DIR / folder
+                    else:
+                        # Fallback for unknown
+                        target_dir = ANIME_DIR / result['title']
+
+                    target_dir.mkdir(parents=True, exist_ok=True)
                     await self.update_processing_message(
                         f"✅ Anime detected: {result['title']}\n"
-                        f"Created directory: {anime_series_dir}")
+                        f"Created directory: {target_dir}")
                 # 2b) TV shows
                 elif result['type'] == 'tv':
                     show_name   = result['title']
@@ -661,8 +675,8 @@ class DownloadTask:
 
             # Step 3: Move file into place
             await self.update_processing_message("Moving to library")
-            safe_name = os.path.basename(self.download_path)
-            dest_path = os.path.join(target_dir, safe_name)
+            safe_name = Path(self.download_path).name
+            dest_path = target_dir / safe_name
             if os.path.exists(dest_path):
                 base, ext = os.path.splitext(dest_path)
                 dest_path = f"{base}_{int(time.time())}{ext}"
