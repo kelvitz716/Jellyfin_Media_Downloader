@@ -2,6 +2,7 @@ import os
 import random
 import re
 import signal
+import sys
 import time
 import asyncio
 import logging
@@ -24,34 +25,54 @@ from cachetools import TTLCache, cached
 # Load environment variables
 load_dotenv()
 
+# Ensure required vars
+for var in ("API_ID","API_HASH","BOT_TOKEN"):
+    if not os.getenv(var):
+        print(f"Error: {var} not set", file=sys.stderr)
+        sys.exit(1)
+
 # Configure logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # Bot Configuration
-API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH')
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-TMDB_API_KEY = os.environ.get('TMDB_API_KEY')
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 # Admin IDs: comma-separated in ENV
-ADMIN_IDS = {
-    int(x.strip().strip('"').strip("'"))
-    for x in os.getenv('ADMIN_IDS', '').split(',')
-    if x.strip().strip('"').strip("'")
-}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x}
 
 # Base directory for downloads & DB
-BASE_DIR = Path.home() / "jellyfin"
-BASE_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR    = Path(os.getenv("BASE_DIR","/data/jellyfin")).expanduser()
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "Downloads")).expanduser()
+MOVIES_DIR   = Path(os.getenv("MOVIES_DIR", BASE_DIR / "Movies")).expanduser()
+TV_DIR       = Path(os.getenv("TV_DIR", BASE_DIR / "TV")).expanduser()
+ANIME_DIR    = Path(os.getenv("ANIME_DIR", BASE_DIR / "Anime")).expanduser()
+MUSIC_DIR    = Path(os.getenv("MUSIC_DIR", BASE_DIR / "Music")).expanduser()
+OTHER_DIR    = Path(os.getenv("OTHER_DIR", BASE_DIR / "Other")).expanduser()
+for d in (BASE_DIR, DOWNLOAD_DIR, MOVIES_DIR, TV_DIR, ANIME_DIR, MUSIC_DIR, OTHER_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-# TinyDB setup (replaces JSON persistence)
-DB_PATH = BASE_DIR / "db.json"
-db = TinyDB(DB_PATH)
-users_tbl = db.table("users")
-stats_tbl = db.table("stats")
+# STDOUT handler
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(formatter)
+# File handler
+fh = logging.FileHandler(BASE_DIR / "bot.log")
+fh.setFormatter(formatter)
+logger.addHandler(sh)
+logger.addHandler(fh)
+
+# Database file (TinyDB)
+DB_PATH = BASE_DIR / os.getenv("DB_FILE", "db.json")
+# Filenames list file (used in /organize or similar handlers)
+FILENAMES_FILE = Path(os.getenv("FILENAMES_FILE", BASE_DIR / "filenames.txt"))
+
+# Initialize TinyDB
+db          = TinyDB(DB_PATH)
+users_tbl   = db.table("users")
+stats_tbl   = db.table("stats")
 
 # Fuzzy‑matching thresholds
 HIGH_CONFIDENCE = 0.8  # auto‑accept
@@ -62,6 +83,9 @@ tmdb_cache = TTLCache(maxsize=500, ttl=3600)
 
 # Shared HTTP session
 aiohttp_session: aiohttp.ClientSession 
+
+# Override incorrect MIME-to-extension mapping
+mimetypes.add_type('video/x-matroska', '.mkv', strict=False)
 
 # Helper functions
 
@@ -88,18 +112,6 @@ def admin_only(func):
 def similarity(a: str, b: str) -> float:
     """Return a ratio [0.0–1.0] of how similar two strings are."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-# Directory Configuration
-dirs = ["Downloads", "Movies", "TV", "Anime", "Music", "Other"]
-for sub in dirs:
-    d = BASE_DIR / sub
-    d.mkdir(parents=True, exist_ok=True)
-DOWNLOAD_DIR = BASE_DIR / "Downloads"
-MOVIES_DIR = BASE_DIR / "Movies"
-TV_DIR = BASE_DIR / "TV"
-ANIME_DIR = BASE_DIR / "Anime"
-MUSIC_DIR = BASE_DIR / "Music"
-OTHER_DIR = BASE_DIR / "Other"
 
 # Global shutdown flags
 shutdown_in_progress = False
@@ -298,13 +310,12 @@ class DownloadTask:
         self.client = client
         self.event = event
         self.message_id = message_id
-        self.download_path = os.path.join(DOWNLOAD_DIR, filename)
+        self.download_path = DOWNLOAD_DIR / filename
         self.ext = self.get_file_extension(filename)
         self.filename = filename if filename.endswith(self.ext) else f"{filename}{self.ext}"
         self.file_size = file_size
         self.start_time = None
         self.end_time = None
-        self.download_path = os.path.join(DOWNLOAD_DIR, filename)
         self.progress = 0
         self.downloaded_bytes = 0
         self.current_speed = 0
@@ -324,35 +335,23 @@ class DownloadTask:
     def get_file_extension(self, filename):
         """
         Determine a file extension:
-        1) If the file already exists on disk, try python-magic.
-        2) If the original filename has a suffix, use that.
-        3) Else try mimetypes.guess_extension.
-        4) Default to .bin.
+         1) Prefer the filename's suffix
+         2) Fallback to mimetypes.guess_extension
+         3) Default to .bin
         """
-        dp = getattr(self, "download_path", None)
-        # 1) Use python-magic if the file exists
-        try:
-            if dp and Path(dp).exists():
-                mime = magic.from_file(str(dp), mime=True)
-                ext = mimetypes.guess_extension(mime)
-                if ext:
-                    return ext
-        except Exception as e:
-            logger.warning(f"Magic sniff failed for {dp}: {e}")
-
-        # 2) Prefer the original suffix if there is one
+        # 1) Prefer the original suffix if present
         suffix = Path(filename).suffix
         if suffix:
             return suffix
 
-        # 3) Fallback to mimetypes
+        # 2) Fallback to mimetypes
         guessed_mime, _ = mimetypes.guess_type(filename)
         if guessed_mime:
             ext = mimetypes.guess_extension(guessed_mime)
             if ext:
                 return ext
 
-        # 4) Ultimate fallback
+        # 3) Ultimate fallback
         return '.bin'
 
     async def start_download(self):
@@ -380,15 +379,27 @@ class DownloadTask:
             )
 
             if not self.cancelled:
+                # ── Post-download extension fix ────────────────────────────────
+                #try:
+                #    fp = Path(self.download_path)
+                #    if fp.exists():
+                #        mime = magic.from_file(str(fp), mime=True)
+                #        new_ext = mimetypes.guess_extension(mime) or self.ext
+                #        if new_ext != self.ext:
+                #            new_path = fp.with_suffix(new_ext)
+                #            fp.rename(new_path)
+                #            self.download_path = str(new_path)
+                #            self.ext = new_ext
+                #except Exception as e:
+                #    logger.warning(f"Post-download magic sniff failed for {self.download_path}: {e}")
+
+                # Record completion time & stats
                 self.end_time = time.time()
                 duration = self.end_time - self.start_time
-
-                # Update stats
                 BotStats.record_download(self.event.sender_id, self.file_size, duration, success=True)
 
                 # Send completion message
                 await self.send_completion_message(duration)
-
                 return True
             return False
         except Exception as e:
@@ -833,8 +844,9 @@ BotStats.global_stats = stats
 BotStats.load_all()
 download_manager = DownloadManager()
 
-# Initialize Telegram client
-client = TelegramClient('jellyfin_bot', API_ID, API_HASH)
+# Telegram client (dynamic session name)
+SESSION_NAME = os.getenv("SESSION_NAME","bot_session")
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 def build_queue_message():
     """

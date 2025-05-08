@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  jellyfin_bot:
+    build: .
+    container_name: jellyfin_bot
+    env_file: [.env]
+    volumes:
+      - ./data/jellyfin:/data/jellyfin        # sessions, DB, downloads, logs
+    restart: unless-stopped
