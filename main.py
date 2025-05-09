@@ -8,6 +8,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 from tinydb import TinyDB, where
 from dotenv import load_dotenv
@@ -86,6 +87,9 @@ aiohttp_session: aiohttp.ClientSession
 
 # Override incorrect MIME-to-extension mapping
 mimetypes.add_type('video/x-matroska', '.mkv', strict=False)
+
+# --- Organize sessions FSM ---
+organize_sessions = defaultdict(dict)
 
 # Helper functions
 
@@ -235,7 +239,7 @@ async def shutdown():
 
 # Download Manager
 class DownloadManager:
-    def __init__(self, max_concurrent=8):
+    def __init__(self, max_concurrent=3):
         self.active_downloads = {}  # message_id: DownloadTask
         self.queued_downloads = []  # list of DownloadTask
         self.max_concurrent = max_concurrent
@@ -260,6 +264,12 @@ class DownloadManager:
                 return len(self.queued_downloads)  # Position in queue
 
     async def _process_download(self, task):
+        # Notify if coming from queue
+        if task.queue_position and task.queue_position > 0:
+            await task.event.respond(
+                f"✅ Your queue position is now 0 — download is starting!"
+            )
+
         try:
             await task.start_download()
             # Process the downloaded file
@@ -663,6 +673,12 @@ class DownloadTask:
                     base = f"{result['title']} ({year})"
                 else:
                     base = os.path.splitext(self.filename)[0]
+
+                # --- Add resolution tag from filename ---
+                resolution = guessit(self.filename).get('screen_size', '').lower()
+                if resolution:
+                    base = f"{base} [{resolution}]"
+
                 # Sanitize file name
                 safe_base = re.sub(r'[\\/:"*?<>|]+', '', base)
                 new_name_str = f"{safe_base}{ext}"
@@ -918,6 +934,149 @@ def build_queue_message():
     return text, buttons
 
 # Handlers
+@client.on(events.NewMessage(pattern='/organize'))
+@admin_only
+async def organize_command(event):
+    user = event.sender_id
+    organize_sessions[user].clear()
+
+    files = list(DOWNLOAD_DIR.glob('*')) + list(OTHER_DIR.glob('*'))
+    if not files:
+        return await event.respond("✅ No files needing categorization.")
+
+    buttons = []
+    for i, f in enumerate(files):
+        organize_sessions[user][f'file_{i}'] = f
+        buttons.append([Button.inline(f.name, f'org_file:file_{i}')])
+    await event.respond("🗂️ Choose a file to categorize:", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=r'org_file:(.+)'))
+async def pick_file(event):
+    user = event.sender_id
+    file_id = event.data.decode().split(':',1)[1]
+    file_path = organize_sessions[user].get(file_id)
+    if not file_path:
+        return await event.respond("⚠️ File not found or session expired.")
+
+    # Extract resolution from filename (e.g. 720p, 1080p)
+    res = guessit(file_path.name).get('screen_size', '')
+    organize_sessions[user] = {
+        "step": "choose_category",
+        "file": file_path,
+        "meta": {
+            "resolution": res
+        }
+    }
+
+    kb = [
+      [ Button.inline("Movie","org_cat:movie"), Button.inline("TV","org_cat:tv") ],
+      [ Button.inline("Anime","org_cat:anime"), Button.inline("Skip","org_cat:skip") ]
+    ]
+    await event.edit(f"🗂️ File: {file_path.name}\nSelect category:", buttons=kb)
+
+@client.on(events.CallbackQuery(pattern=r'org_cat:(\w+)'))
+async def pick_category(event):
+    user = event.sender_id
+    session = organize_sessions[user]
+    choice  = event.data.decode().split(':',1)[1]
+
+    if choice == 'skip':
+        await event.edit(f"⏭️ Skipped `{session['file'].name}`.")
+        organize_sessions.pop(user, None)
+        return
+
+    session['meta']['category'] = choice
+    session['step'] = 'ask_title'
+
+    guess = guessit(session['file'].name).get('title','')
+    await event.edit(
+        f"✏️ Category: **{choice.title()}**\n"
+        f"Reply with *Title* (suggestion: `{guess}`)"
+    )
+
+@client.on(events.NewMessage)
+async def organize_flow(event):
+    user = event.sender_id
+    if user not in organize_sessions:
+        return
+
+    session = organize_sessions.get(user)
+    if 'step' not in session:
+        return
+    text = event.raw_text.strip()
+    step = session['step']
+
+    if step == 'ask_title':
+        session['meta']['title'] = text
+        session['step'] = 'ask_year_or_next'
+        if session['meta']['category'] == 'movie':
+            return await event.respond("✏️ Now reply with *Year* (e.g. 2023):")
+        else:
+            return await event.respond("✏️ Now reply with *Season number* (e.g. 1):")
+
+    if step == 'ask_year_or_next':
+        cat = session['meta']['category']
+        if cat == 'movie':
+            session['meta']['year'] = text
+            session['step'] = 'finalize'
+            return await event.respond("✅ Got it! Moving the file…")
+        else:
+            session['meta']['season'] = int(text)
+            session['step'] = 'ask_episode'
+            return await event.respond("✏️ Reply with *Episode number* (e.g. 3):")
+
+    if step == 'ask_episode':
+        session['meta']['episode'] = int(text)
+        session['step'] = 'finalize'
+        return await event.respond("✅ Got it! Moving the file…")
+
+    if step == 'finalize':
+        fpath = session['file']
+        m     = session['meta']
+        res   = m.get('resolution', '').upper()
+
+        # build target folder by category
+        if m['category'] == 'movie':
+            folder = MOVIES_DIR / f"{m['title']} ({m['year']})"
+            # filename: Title (Year) [RES].ext
+            base = f"{m['title']} ({m['year']})"
+        elif m['category'] == 'tv':
+            folder = TV_DIR / m['title'] / f"Season {m['season']:02d}"
+            # filename: Title - S01E02 [RES].ext
+            ep = f"S{m['season']:02d}E{m['episode']:02d}"
+            base = f"{m['title']} - {ep}"
+        else:  # anime
+            if 'episode' in m:
+                folder = ANIME_DIR / m['title'] / f"Season {m['season']:02d}"
+                ep = f"S{m['season']:02d}E{m['episode']:02d}"
+                base = f"{m['title']} - {ep}"
+            else:
+                folder = ANIME_DIR / f"{m['title']} ({m.get('year','')})"
+                base = f"{m['title']} ({m.get('year','')})"
+
+        folder.mkdir(parents=True, exist_ok=True)
+
+        # assemble new filename with resolution tag
+        ext = fpath.suffix
+        if res:
+            new_name = f"{base} [{res}]{ext}"
+        else:
+            new_name = f"{base}{ext}"
+
+        dest = folder / new_name
+        shutil.move(str(fpath), str(dest))
+        await event.respond(f"✅ Moved to `{dest}`")
+
+        organize_sessions.pop(user, None)
+        await event.respond("🗂️ Send /organize to categorize another file, or /done to exit.")
+
+@client.on(events.NewMessage(pattern='/done|/cancel'))
+async def cancel_organize(event):
+    user = event.sender_id
+    if user in organize_sessions:
+        organize_sessions.pop(user, None)
+        return await event.respond("🚫 Categorization cancelled.")
+
 @client.on(events.NewMessage(pattern='/shutdown'))
 @admin_only
 async def shutdown_command(event):
@@ -955,6 +1114,7 @@ async def start_command(event):
         "/test - 🔍 Run system test\n"
         "/help - ❓ Show usage help\n\n"
         "/users - 👥 View total unique users (admin only)\n"
+        "/organize - 🗂️ Organize files into categories (admin only)\n"
         "/shutdown - 🔌 Gracefully shut down the bot (admin only)\n\n"
         "📱 SUPPORTED FORMATS:\n"
         "🎬 Videos - MP4, MKV, AVI, etc.\n"
