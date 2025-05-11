@@ -41,11 +41,34 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# Bot Configuration
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+REQUIRED_ENV = {
+    'API_ID': {'val': None, 'required': True},
+    'API_HASH': {'val': None, 'required': True},
+    'BOT_TOKEN': {'val': None, 'required': True},
+    'TMDB_API_KEY': {'val': None, 'required': False},  # metadata optional
+}
+
+# Maximum download duration (seconds); default 2 hours
+MAX_DOWNLOAD_DURATION = int(os.getenv("MAX_DOWNLOAD_DURATION", "7200"))
+
+# load and validate env vars
+print("Loading environment variables...")
+for name, meta in REQUIRED_ENV.items():
+    val = os.getenv(name)
+    meta['val'] = val
+    if val:
+        status = 'OK'
+    else:
+        status = 'MISSING' if meta['required'] else 'DISABLED'
+    print(f"  {name}: {status}")
+    if status == 'MISSING':
+        sys.exit(1)
+
+# assign for backward compatibility
+API_ID = REQUIRED_ENV['API_ID']['val']
+API_HASH = REQUIRED_ENV['API_HASH']['val']
+BOT_TOKEN = REQUIRED_ENV['BOT_TOKEN']['val']
+TMDB_API_KEY = REQUIRED_ENV['TMDB_API_KEY']['val']
 # Admin IDs: comma-separated in ENV
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x}
 
@@ -57,8 +80,16 @@ TV_DIR       = Path(os.getenv("TV_DIR", BASE_DIR / "TV")).expanduser()
 ANIME_DIR    = Path(os.getenv("ANIME_DIR", BASE_DIR / "Anime")).expanduser()
 MUSIC_DIR    = Path(os.getenv("MUSIC_DIR", BASE_DIR / "Music")).expanduser()
 OTHER_DIR    = Path(os.getenv("OTHER_DIR", BASE_DIR / "Other")).expanduser()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+def create_dir_safely(path: Path):
+    if not path.exists():
+        logger.info(f"Creating directory: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+
+# Create essential directories with retry logic
 for d in (BASE_DIR, DOWNLOAD_DIR, MOVIES_DIR, TV_DIR, ANIME_DIR, MUSIC_DIR, OTHER_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+    create_dir_safely(d)
 
 # STDOUT handler
 sh = logging.StreamHandler(sys.stdout)
@@ -506,17 +537,24 @@ class DownloadManager:
 
     async def cancel_download(self, message_id):
         async with self.lock:
-            # Check if it's in active downloads
+            # 1) Active download cancellation
             if message_id in self.active_downloads:
-                task = self.active_downloads[message_id]
+                task = self.active_downloads.pop(message_id)
                 await task.cancel()
-                del self.active_downloads[message_id]
+
+                # Immediately start the next queued task, if any
+                if self.queued_downloads:
+                    next_task = self.queued_downloads.pop(0)
+                    self.active_downloads[next_task.message_id] = next_task
+                    stats.update_peak_concurrent(len(self.active_downloads))
+                    asyncio.create_task(self._process_download(next_task))
+
                 return True
 
-            # Check if it's in the queue
-            for i, task in enumerate(self.queued_downloads):
+            # 2) Remove from queue if pending
+            for idx, task in enumerate(self.queued_downloads):
                 if task.message_id == message_id:
-                    self.queued_downloads.pop(i)
+                    self.queued_downloads.pop(idx)
                     await task.cancel()
                     return True
 
@@ -550,6 +588,7 @@ class DownloadTask:
         self.process_message = None
         # Identify large files upfront and save as instance variable
         self.large_file = file_size > 500 * 1024 * 1024  # > 500 MB
+        self.max_duration = MAX_DOWNLOAD_DURATION
         self.download_manager = download_manager
         self.queue_position = None
         self.last_update_time = None
@@ -597,28 +636,26 @@ class DownloadTask:
                 f"ℹ️ Status updates every {update_interval}"
             )
 
-            # Start the download
-            await self.client.download_media(
-                self.event.message,
-                self.download_path,
-                progress_callback=self.progress_callback
-            )
+            # Start the download, but enforce a max-duration
+            try:
+                async with timeout(self.max_duration):
+                    await self.client.download_media(
+                        self.event.message,
+                        self.download_path,
+                        progress_callback=self.progress_callback
+                    )
+            except asyncio.TimeoutError:
+                # Auto-cancel on timeout
+                reason = humanize.precisedelta(timedelta(seconds=self.max_duration))
+                logger.warning(f"Download {self.filename} timed out after {reason}")
+                await self.event.respond(
+                    f"⚠️ Download timed out after {reason}. Cancelling automatically."
+                )
+                await self.cancel()
+                BotStats.record_download(self.event.sender_id, 0, 0, success=False)
+                return False
 
-            if not self.cancelled:
-                # ── Post-download extension fix ────────────────────────────────
-                #try:
-                #    fp = Path(self.download_path)
-                #    if fp.exists():
-                #        mime = magic.from_file(str(fp), mime=True)
-                #        new_ext = mimetypes.guess_extension(mime) or self.ext
-                #        if new_ext != self.ext:
-                #            new_path = fp.with_suffix(new_ext)
-                #            fp.rename(new_path)
-                #            self.download_path = str(new_path)
-                #            self.ext = new_ext
-                #except Exception as e:
-                #    logger.warning(f"Post-download magic sniff failed for {self.download_path}: {e}")
-
+            if not self.cancelled:                
                 # Record completion time & stats
                 self.end_time = time.time()
                 duration = self.end_time - self.start_time
