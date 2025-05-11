@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
+from typing import List
 
 from tinydb import TinyDB, where
 from dotenv import load_dotenv
@@ -21,6 +22,8 @@ from guessit import guessit
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from async_timeout import timeout
 from cachetools import TTLCache, cached
 
 # Load environment variables
@@ -34,7 +37,7 @@ for var in ("API_ID","API_HASH","BOT_TOKEN"):
 
 # Configure logging
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # Bot Configuration
@@ -65,15 +68,18 @@ fh.setFormatter(formatter)
 logger.addHandler(sh)
 logger.addHandler(fh)
 
-# Database file (TinyDB)
-DB_PATH = BASE_DIR / os.getenv("DB_FILE", "db.json")
 # Filenames list file (used in /organize or similar handlers)
 FILENAMES_FILE = Path(os.getenv("FILENAMES_FILE", BASE_DIR / "filenames.txt"))
 
 # Initialize TinyDB
+# Database file (TinyDB)
+DB_PATH = BASE_DIR / os.getenv("DB_FILE", "db.json")
+# Initialize TinyDB and tables
 db          = TinyDB(DB_PATH)
 users_tbl   = db.table("users")
 stats_tbl   = db.table("stats")
+organized_tbl = db.table("organized")
+error_log_tbl = db.table("error_log")
 
 # Fuzzy‑matching thresholds
 HIGH_CONFIDENCE = 0.8  # auto‑accept
@@ -86,7 +92,20 @@ tmdb_cache = TTLCache(maxsize=500, ttl=3600)
 aiohttp_session: aiohttp.ClientSession 
 
 # Override incorrect MIME-to-extension mapping
+mimetypes.init()
 mimetypes.add_type('video/x-matroska', '.mkv', strict=False)
+
+# Merge the two dicts so we see both “official” and “common” mappings
+combined_map = {}
+combined_map.update(mimetypes.types_map)
+combined_map.update(mimetypes.common_types)
+
+# Now pick video/* extensions
+MEDIA_EXTENSIONS = {
+    ext.lower()
+    for ext, mime in combined_map.items()
+    if mime and mime.startswith("video/")
+}
 
 # --- Organize sessions FSM ---
 organize_sessions = defaultdict(dict)
@@ -122,6 +141,151 @@ shutdown_in_progress = False
 force_shutdown = False
 last_sigint_time = 0
 FORCE_SHUTDOWN_TIMEOUT = 10  # seconds
+
+
+class InteractiveOrganizer:
+    def __init__(self):
+        self.organized_tbl = organized_tbl
+        self.error_log_tbl = error_log_tbl
+
+    def is_already_organized(self, file_name: str) -> bool:
+        """Check TinyDB to see if this filename was already handled."""
+        return bool(self.organized_tbl.get(lambda r: r.get("path", "").endswith(file_name)))
+
+    def scan_for_candidates(self) -> List[Path]:
+        """Scan DOWNLOAD_DIR and OTHER_DIR for files not yet organized."""
+        candidates = []
+        for base in (DOWNLOAD_DIR, OTHER_DIR):
+            for p in Path(base).rglob("*"):
+                if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS:
+                    if not self.is_already_organized(p.name):
+                        candidates.append(p)
+        return candidates
+
+    async def prompt_for_category_and_metadata(self, session, file_path: Path) -> dict:
+        """
+        Interactive prompt: category, title, year, season/episode.
+        Returns metadata dict.
+        """
+        client = session.client
+
+        async def ask(question: str):
+            await session.respond(question)
+            ev = await client.wait_event(
+                events.NewMessage(incoming=True, from_users=session.sender_id),
+                timeout=60
+            )
+            return ev.text.strip()
+
+        # 1) category
+        cat = await ask("Enter category (`movie`, `tv`, or `anime`):")
+        cat = cat.lower()
+        if cat not in {"movie", "tv", "anime"}:
+            await session.respond("Invalid category, defaulting to `movie`.")
+            cat = "movie"
+
+        # 2) title
+        title = await ask("Enter title:")
+
+        # 3) year
+        year_text = await ask("Enter year (e.g. `2021`):")
+        year = int(year_text) if year_text.isdigit() else None
+
+        # 4) season/episode if needed
+        season = episode = None
+        if cat in {"tv", "anime"}:
+            s = await ask("Enter season number:")
+            e = await ask("Enter episode number:")
+            season = int(s) if s.isdigit() else None
+            episode = int(e) if e.isdigit() else None
+
+        return {
+            "path": str(file_path),
+            "category": cat,
+            "title": title,
+            "year": year,
+            "season": season,
+            "episode": episode,
+            "organized_by": session.sender_id,
+        }
+
+    def detect_resolution(self, path: Path) -> str:
+        """Detect video resolution via filename (e.g. `1080p`) or default."""
+        m = re.search(r"(\d{3,4}p)", path.name, re.IGNORECASE)
+        return m.group(1) if m else "Unknown"
+
+    async def show_preview_panel(self, session, src: Path, proposed_dest: Path) -> bool:
+        """Show a preview with Confirm/Amend/Discard buttons."""
+        kb = [
+            [Button.inline("✅ Confirm", b"confirm")],
+            [Button.inline("✏️ Amend",    b"amend")],
+            [Button.inline("❌ Discard",  b"discard")],
+        ]
+        msg = await session.respond(
+            f"Preview rename:\n`{src.name}` → `{proposed_dest.name}`",
+            buttons=kb, parse_mode="markdown"
+        )
+
+        # wait for one callback
+        @session.client.on(events.CallbackQuery)
+        async def _(ev):
+            if ev.query.user_id != session.sender_id:
+                return
+            await ev.answer()
+            await msg.delete()
+            session.data["preview_choice"] = ev.data  # store raw bytes
+            raise asyncio.CancelledError  # break out of wait_event
+
+        try:
+            await session.client.wait_event(events.CallbackQuery, timeout=60)
+        except asyncio.CancelledError:
+            choice = session.data.pop("preview_choice", b"")
+            return choice == b"confirm"
+        except asyncio.TimeoutError:
+            await session.respond("⏰ Preview timed out; discarding.")
+            return False
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
+           retry=retry_if_exception_type(Exception))
+    def safe_rename(self, src: Path, dest: Path):
+        """Rename/move file with retries via tenacity."""
+        src.rename(dest)
+
+    def record_organized(self, metadata: dict):
+        """Persist a successful organize operation into organized_tbl."""
+        entry = {
+            "path": metadata["path"],
+            "title": metadata["title"],
+            "category": metadata["category"],
+            "year": metadata.get("year"),
+            "season": metadata.get("season"),
+            "episode": metadata.get("episode"),
+            "resolution": self.detect_resolution(Path(metadata["path"])),
+            "organized_by": metadata["organized_by"],
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
+        }
+        self.organized_tbl.insert(entry)
+
+    async def show_bulk_preview_panel(self, session, items: List[dict]):
+        """After first episode, show bulk items with Confirm/Amend/Skip."""
+        for idx, item in enumerate(items, start=1):
+            await asyncio.sleep(0)  # allow cancellation
+            await session.respond(
+                f"{idx}/{len(items)}  `{item['src'].name}` → `{item['dest'].name}`\n"
+                "Reply `yes` to confirm, `no` to skip."
+            )
+
+    async def process_bulk_queue(self):
+        """Iterate through pending bulk items and handle admin responses."""
+        # Placeholder: implement per-item confirm/amend/skip flow in Sprint 7
+        await asyncio.sleep(0)
+
+    def record_error(self, context: dict):
+        """Log error context into error_log_tbl."""
+        self.error_log_tbl.insert({
+            **context,
+            "timestamp": __import__("datetime").datetime.now().isoformat()
+        })
 
 # BotStats class with TinyDB persistence
 class BotStats:
@@ -660,7 +824,9 @@ class DownloadTask:
 
             # ─── Rename for high‑confidence matches ───────────────────────────────
             if score >= HIGH_CONFIDENCE:
-                ext = Path(self.download_path).suffix # Use Path.suffix
+                # 1) Prepare ext & base name
+                orig_name = Path(self.download_path).name
+                ext       = Path(self.download_path).suffix
                 # Build Jellyfin‑friendly base name (consistent with organization logic)
                 if result.get('is_anime') and result.get('type') == 'tv':
                     base = f"{result['title']} - Episode {result.get('episode', '')}"
@@ -675,32 +841,31 @@ class DownloadTask:
                     base = os.path.splitext(self.filename)[0]
 
                 # --- Add resolution tag from filename ---
-                resolution = guessit(self.filename).get('screen_size', '').lower()
+                resolution = guessit(orig_name).get('screen_size', '').lower()
                 if resolution:
                     base = f"{base} [{resolution}]"
 
                 # Sanitize file name
-                safe_base = re.sub(r'[\\/:"*?<>|]+', '', base)
+                safe_base   = re.sub(r'[\\/:"*?<>|]+', '', base)
                 new_name_str = f"{safe_base}{ext}"
-                # Rename on disk and update path using Path
-                new_path = Path(self.download_path).parent / new_name_str
+                new_path     = Path(self.download_path).with_name(new_name_str)
+                logger.info(f"Renaming for TMDb → {self.download_path} → {new_path}")
                 os.rename(self.download_path, new_path)
-                self.download_path = new_path
-            # ────────────────────────────────────────────────────────────────────────
+                self.download_path = str(new_path)
 
-
-            # Step 3: Move file into place
+            # Step 3: Move file into its final library folder
             await self.update_processing_message("Moving to library")
-            safe_name = Path(self.download_path).name
-            dest_path: Path = target_dir / safe_name
+            final_name = Path(self.download_path).name
+            dest_path: Path = target_dir / final_name
             if dest_path.exists():
                 base, ext = os.path.splitext(dest_path)
                 dest_path = f"{base}_{int(time.time())}{ext}"
-            shutil.move(str(Path(self.download_path)), str(dest_path)) # shutil may require strings
+            logger.info(f"Moving final file → {self.download_path} → {dest_path}")
+            shutil.move(self.download_path, str(dest_path))
 
             processing_time = time.time() - self.end_time
             await self.update_processing_message(
-                f"✅ Processed {safe_name} in {processing_time:.1f}s\nMoved to: {dest_path}",
+                f"✅ Processed {final_name} in {processing_time:.1f}s\nMoved to: {dest_path}",
                 final=True
             )
 
@@ -933,21 +1098,43 @@ def build_queue_message():
 
     return text, buttons
 
+# Create a single organizer instance (so it reuses the same TinyDB tables, etc.)
+organizer = InteractiveOrganizer()
+
 # Handlers
 @client.on(events.NewMessage(pattern='/organize'))
 @admin_only
 async def organize_command(event):
+    # ── DEBUG: dump raw contents of both directories ──
+    raw_dl = list(Path(DOWNLOAD_DIR).iterdir())
+    raw_oth = list(Path(OTHER_DIR).iterdir())
+    await event.respond(
+        f"DEBUG ▶ DOWNLOAD_DIR={DOWNLOAD_DIR}\n"
+        f"  contains: {[p.name for p in raw_dl]}\n"
+        f"DEBUG ▶ OTHER_DIR={OTHER_DIR}\n"
+        f"  contains: {[p.name for p in raw_oth]}"
+    )
+
     user = event.sender_id
     organize_sessions[user].clear()
 
-    files = list(DOWNLOAD_DIR.glob('*')) + list(OTHER_DIR.glob('*'))
-    if not files:
-        return await event.respond("✅ No files needing categorization.")
+    # use the organizer class to find candidates
+    # debug: show what extensions we’re accepting
+    await event.respond(f"DEBUG ▶ Accepting extensions: {sorted(MEDIA_EXTENSIONS)}")
+    candidates = organizer.scan_for_candidates()
+    if not candidates:
+        return await event.respond(
+            "✅ No files needing categorization.\n\n"
+            f"(I saw {len(list(Path(DOWNLOAD_DIR).rglob('*')))} files on disk — "
+            "check your extensions filter.)"
+        )
 
+    # build your button list
     buttons = []
-    for i, f in enumerate(files):
-        organize_sessions[user][f'file_{i}'] = f
-        buttons.append([Button.inline(f.name, f'org_file:file_{i}')])
+    for idx, path in enumerate(candidates):
+        key = f"file_{idx}"
+        organize_sessions[user][key] = path
+        buttons.append([Button.inline(path.name, f'org_file:{key}')])
     await event.respond("🗂️ Choose a file to categorize:", buttons=buttons)
 
 @client.on(events.CallbackQuery(pattern=r'org_file:(.+)'))
@@ -958,8 +1145,8 @@ async def pick_file(event):
     if not file_path:
         return await event.respond("⚠️ File not found or session expired.")
 
-    # Extract resolution from filename (e.g. 720p, 1080p)
-    res = guessit(file_path.name).get('screen_size', '')
+    # use organizer to detect resolution
+    res = organizer.detect_resolution(file_path)
     organize_sessions[user] = {
         "step": "choose_category",
         "file": file_path,
@@ -1018,8 +1205,9 @@ async def organize_flow(event):
         cat = session['meta']['category']
         if cat == 'movie':
             session['meta']['year'] = text
-            session['step'] = 'finalize'
-            return await event.respond("✅ Got it! Moving the file…")
+            await event.respond("✅ Got it! Moving the file…")
+            await _run_finalize(event, session)
+            return
         else:
             session['meta']['season'] = int(text)
             session['step'] = 'ask_episode'
@@ -1027,56 +1215,66 @@ async def organize_flow(event):
 
     if step == 'ask_episode':
         session['meta']['episode'] = int(text)
-        session['step'] = 'finalize'
-        return await event.respond("✅ Got it! Moving the file…")
+        await event.respond("✅ Got it! Moving the file…")
+        await _run_finalize(event, session)
+        return
 
-    if step == 'finalize':
-        fpath = session['file']
-        m     = session['meta']
-        res   = m.get('resolution', '').upper()
+async def _run_finalize(event, session):
+    """Handles folder creation, safe rename, DB record, and user feedback."""
+    fpath = session['file']
+    m     = session['meta']
+    res   = m.get('resolution', '').upper()
 
-        # build target folder by category
-        if m['category'] == 'movie':
-            folder = MOVIES_DIR / f"{m['title']} ({m['year']})"
-            # filename: Title (Year) [RES].ext
-            base = f"{m['title']} ({m['year']})"
-        elif m['category'] == 'tv':
-            folder = TV_DIR / m['title'] / f"Season {m['season']:02d}"
-            # filename: Title - S01E02 [RES].ext
-            ep = f"S{m['season']:02d}E{m['episode']:02d}"
-            base = f"{m['title']} - {ep}"
-        else:  # anime
-            if 'episode' in m:
-                folder = ANIME_DIR / m['title'] / f"Season {m['season']:02d}"
-                ep = f"S{m['season']:02d}E{m['episode']:02d}"
-                base = f"{m['title']} - {ep}"
-            else:
-                folder = ANIME_DIR / f"{m['title']} ({m.get('year','')})"
-                base = f"{m['title']} ({m.get('year','')})"
-
-        folder.mkdir(parents=True, exist_ok=True)
-
-        # assemble new filename with resolution tag
-        ext = fpath.suffix
-        if res:
-            new_name = f"{base} [{res}]{ext}"
+    # Determine base folder & filename
+    if m['category'] == 'movie':
+        folder = MOVIES_DIR / f"{m['title']} ({m['year']})"
+        base   = f"{m['title']} ({m['year']})"
+    elif m['category'] == 'tv':
+        folder = TV_DIR / m['title'] / f"Season {m['season']:02d}"
+        ep     = f"S{m['season']:02d}E{m['episode']:02d}"
+        base   = f"{m['title']} - {ep}"
+    else:  # anime
+        if 'episode' in m:
+            folder = ANIME_DIR / m['title'] / f"Season {m['season']:02d}"
+            ep     = f"S{m['season']:02d}E{m['episode']:02d}"
+            base   = f"{m['title']} - {ep}"
         else:
-            new_name = f"{base}{ext}"
+            folder = ANIME_DIR / f"{m['title']} ({m.get('year','')})"
+            base   = f"{m['title']} ({m.get('year','')})"
 
-        dest = folder / new_name
-        logger.info(f"Organize: moving `{fpath}` → `{dest}`")
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(fpath), str(dest))
-            await event.respond(f"✅ Moved to `{dest}`")
-        except Exception as e:
-            logger.error(f"Organize move failed: {e}", exc_info=True)
-            await event.respond(f"⚠️ Could not move file: {e}")
+    # Build destination path
+    folder.mkdir(parents=True, exist_ok=True)
+    ext     = fpath.suffix
+    new_name= f"{base} [{res}]{ext}" if res else f"{base}{ext}"
+    dest    = folder / new_name
 
-        organize_sessions.pop(user, None)
-        await event.respond("🗂️ Send /organize to categorize another file, or /done to exit.")
+    logger.info(f"Organize: moving `{fpath}` → `{dest}`")
+    try:
+        organizer.safe_rename(fpath, dest)
+        organizer.record_organized({
+            "path": str(dest),
+            "title": m["title"],
+            "category": m["category"],
+            "year": m.get("year"),
+            "season": m.get("season"),
+            "episode": m.get("episode"),
+            "resolution": res,
+            "organized_by": event.sender_id
+        })
+        await event.respond(f"✅ Moved to `{dest}`")
+    except Exception as e:
+        organizer.record_error({
+            "error": str(e),
+            "file": str(fpath),
+            "stage": "finalize"
+        })
+        await event.respond(f"⚠️ Could not move file: {e}")
 
-@client.on(events.NewMessage(pattern='/done|/cancel'))
+    # Clean up session
+    organize_sessions.pop(event.sender_id, None)
+    await event.respond("🗂️ Send /organize to categorize another file, or /propagate to propagate.")
+
+@client.on(events.NewMessage(pattern='/cancel'))
 async def cancel_organize(event):
     user = event.sender_id
     if user in organize_sessions:
