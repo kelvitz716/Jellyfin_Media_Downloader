@@ -1,3 +1,4 @@
+from itertools import islice
 import os
 import random
 import re
@@ -37,7 +38,7 @@ for var in ("API_ID","API_HASH","BOT_TOKEN"):
 
 # Configure logging
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
 # Bot Configuration
@@ -135,6 +136,13 @@ def admin_only(func):
 def similarity(a: str, b: str) -> float:
     """Return a ratio [0.0–1.0] of how similar two strings are."""
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+# Helper: paginate TinyDB results (returns page + total count)
+def paginate_db(table, limit=10, offset=0):
+    all_entries = sorted(table.all(), key=lambda r: r.get("timestamp", ""), reverse=True)
+    total = len(all_entries)
+    page = list(islice(all_entries, offset, offset + limit))
+    return page, total
 
 # Global shutdown flags
 shutdown_in_progress = False
@@ -263,6 +271,7 @@ class InteractiveOrganizer:
             "resolution": self.detect_resolution(Path(metadata["path"])),
             "organized_by": metadata["organized_by"],
             "timestamp": __import__("datetime").datetime.now().isoformat(),
+            "method": metadata.get("method", "manual"),
         }
         self.organized_tbl.insert(entry)
 
@@ -863,6 +872,22 @@ class DownloadTask:
             logger.info(f"Moving final file → {self.download_path} → {dest_path}")
             shutil.move(self.download_path, str(dest_path))
 
+            # Record automatic organization
+            try:
+                organizer.record_organized({
+                    "path": str(dest_path),
+                    "title": result.get("title", Path(dest_path).stem),
+                    "category": result.get("type", "unknown"),
+                    "year": result.get("year"),
+                    "season": result.get("season"),
+                    "episode": result.get("episode"),
+                    "resolution": guessit(Path(dest_path).name).get("screen_size",""),
+                    "organized_by": self.event.sender_id,
+                    "method": "auto",
+                })
+            except Exception as e:
+                logger.error(f"Failed to record auto-organize: {e}")
+
             processing_time = time.time() - self.end_time
             await self.update_processing_message(
                 f"✅ Processed {final_name} in {processing_time:.1f}s\nMoved to: {dest_path}",
@@ -1102,7 +1127,7 @@ def build_queue_message():
 organizer = InteractiveOrganizer()
 
 # Handlers
-@client.on(events.NewMessage(pattern='/organize'))
+@client.on(events.NewMessage(pattern='^/organize$'))
 @admin_only
 async def organize_command(event):
     # ── DEBUG: dump raw contents of both directories ──
@@ -1273,6 +1298,118 @@ async def _run_finalize(event, session):
     # Clean up session
     organize_sessions.pop(event.sender_id, None)
     await event.respond("🗂️ Send /organize to categorize another file, or /propagate to propagate.")
+
+# /organized command
+@client.on(events.NewMessage(pattern=r'^/organized$'))
+@admin_only
+async def organized_command(event):
+    await show_organized_page(event, offset=0)
+
+@client.on(events.CallbackQuery(pattern=r'^org_page:(\d+)$'))
+async def organized_page_callback(event):
+    offset = int(event.data.decode().split(":")[1])
+    await show_organized_page(event, offset=offset)
+
+async def show_organized_page(event, offset=0):
+    # Only manually organized entries
+    manual = [e for e in organized_tbl.all() if e.get("method","manual") == "manual"]
+    manual_sorted = sorted(manual, key=lambda r: r.get("timestamp",""), reverse=True)
+    total = len(manual_sorted)
+    page = manual_sorted[offset:offset+10]
+    if not page:
+        return await event.respond("📁 No organized entries found.")
+
+    buttons = []
+    for entry in page:
+        label = f"{entry['title']} ({entry.get('year','')})"
+        ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
+        eid = entry.doc_id
+        buttons.append([
+            Button.inline(f"🔁 {label}", f"reorg:{eid}"),
+            Button.inline(f"🕓 {ts}", f"noop:{eid}"),
+            Button.inline(f"🗑️", f"delorg:{eid}")
+        ])
+
+    nav = []
+    if offset > 0:
+        nav.append(Button.inline("◀️ Prev", f"org_page:{max(0, offset-10)}"))
+    if offset + 10 < total:
+        nav.append(Button.inline("▶️ Next", f"org_page:{offset+10}"))
+    if nav:
+        buttons.append(nav)
+
+    text = f"📁 Recently organized files ({offset+1}–{offset+len(page)} of {total}):"
+    await event.respond(text, buttons=buttons)
+
+# /history command
+@client.on(events.NewMessage(pattern=r'^/history$'))
+@admin_only
+async def history_command(event):
+    await show_history_page(event, offset=0)
+
+@client.on(events.CallbackQuery(pattern=r'^hist_page:(\d+)$'))
+async def history_page_callback(event):
+    offset = int(event.data.decode().split(":")[1])
+    await show_history_page(event, offset=offset)
+
+async def show_history_page(event, offset=0):
+    # All entries, manual + auto
+    all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp",""), reverse=True)
+    total = len(all_sorted)
+    page = all_sorted[offset:offset+10]
+    if not page:
+        return await event.respond("📁 No history available.")
+
+    buttons = []
+    for entry in page:
+        name = Path(entry['path']).name
+        ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
+        method = entry.get("method","manual").capitalize()
+        eid = entry.doc_id
+        buttons.append([
+            Button.inline(f"📄 {name}", f"noop:{eid}"),
+            Button.inline(f"{method}", f"noop:{eid}"),
+            Button.inline("🔁", f"reorg:{eid}"),
+            Button.inline("🗑️", f"delorg:{eid}"),
+            Button.inline(f"🕓 {ts}", f"noop:{eid}")
+        ])
+
+    nav = []
+    if offset > 0:
+        nav.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset-10)}"))
+    if offset + 10 < total:
+        nav.append(Button.inline("▶️ Next", f"hist_page:{offset+10}"))
+    if nav:
+        buttons.append(nav)
+
+    await event.respond(f"🕓 Recent history ({offset+1}–{offset+len(page)} of {total}):", buttons=buttons)
+
+@client.on(events.CallbackQuery(pattern=r'reorg:(\d+)'))
+async def reorganize_entry(event):
+    eid = int(event.data.decode().split(':')[1])
+    entry = organized_tbl.get(doc_id=eid)
+    if not entry:
+        return await event.respond("⚠️ Entry not found.")
+    fake_event = event  # reuse current event
+    session = {
+        "file": Path(entry['path']),
+        "meta": {
+            "title": entry['title'],
+            "category": entry['category'],
+            "year": entry.get('year'),
+            "season": entry.get('season'),
+            "episode": entry.get('episode'),
+            "resolution": entry.get('resolution'),
+        }
+    }
+    await _run_finalize(fake_event, session)
+
+@client.on(events.CallbackQuery(pattern=r'delorg:(\d+)'))
+async def delete_organized_record(event):
+    eid = int(event.data.decode().split(':')[1])
+    organized_tbl.remove(doc_ids=[eid])
+    await event.answer("🗑️ Deleted record.", alert=False)
+    await event.edit("✅ Record deleted.")
 
 @client.on(events.NewMessage(pattern='/cancel'))
 async def cancel_organize(event):
