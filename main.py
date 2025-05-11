@@ -111,6 +111,9 @@ MEDIA_EXTENSIONS = {
 # --- Organize sessions FSM ---
 organize_sessions = defaultdict(dict)
 
+# In-memory state for bulk propagation
+bulk_sessions = defaultdict(lambda: {"items": [], "index": 0})
+
 # Helper functions
 
 def load_active_users() -> set[int]:
@@ -144,6 +147,38 @@ def paginate_db(table, limit=10, offset=0):
     page = list(islice(all_entries, offset, offset + limit))
     return page, total
 
+def find_remaining_episodes(folder: Path, title: str, season: int, last_ep: int) -> list:
+    """
+    Scan DOWNLOAD_DIR for unorganized episodes matching title+season,
+    with episode > last_ep.
+    Returns list of dicts: {src: Path, dest: Path, season, episode}.
+    """
+    results = []
+    for p in DOWNLOAD_DIR.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in MEDIA_EXTENSIONS:
+            continue
+        info = guessit(p.name)
+        if info.get("type") != "episode":
+            continue
+        if info.get("season") != season:
+            continue
+        ep = info.get("episode")
+        if not ep or ep <= last_ep:
+            continue
+        # fuzzy title match
+        if similarity(info.get("title",""), title) < 0.8:
+            continue
+        # skip if already in DB
+        if organizer.is_already_organized(p.name):
+            continue
+        # build destination path
+        base = f"{title} - S{season:02d}E{ep:02d}"
+        res  = organizer.detect_resolution(p)
+        new_name = f"{base} [{res}]{p.suffix}"
+        dest = folder / new_name
+        results.append({"src": p, "dest": dest, "season": season, "episode": ep})
+    # sort by episode number
+    return sorted(results, key=lambda i: i["episode"])
 # Global shutdown flags
 shutdown_in_progress = False
 force_shutdown = False
@@ -1127,6 +1162,94 @@ def build_queue_message():
 organizer = InteractiveOrganizer()
 
 # Handlers
+@client.on(events.NewMessage(pattern=r'^/propagate$'))
+@admin_only
+async def propagate_command(event):
+    """
+    Bulk-propagation: after a manual organize,
+    find remaining episodes and ask yes/no per file.
+    """
+    # get last manual entry
+    manual = [r for r in organized_tbl.all() if r.get("method","manual")=="manual"]
+    entries = sorted(manual, key=lambda r: r["timestamp"], reverse=True)
+    if not entries:
+        return await event.respond("📁 No manual organizes to propagate from.")
+    last = entries[0]
+    folder = Path(last["path"]).parent
+    title  = last["title"]
+    season = last["season"]
+    ep0    = last["episode"]
+    items = find_remaining_episodes(folder, title, season, ep0)
+    if not items:
+        return await event.respond("✅ No remaining episodes found for bulk propagation.")
+    
+    # initialize session
+    bulk_sessions[event.sender_id] = {"items": items, "index": 0}
+    cur = items[0]
+    # send first prompt with inline buttons
+    await event.respond(
+        f"📦 Bulk propagation started: 1/{len(items)}\n"
+        f"`{cur['src'].name}` → `{cur['dest'].name}`",
+        buttons=[
+            [Button.inline("✅ Yes", f"bulk_ans:yes"),
+             Button.inline("❌ No",  f"bulk_ans:no")]
+        ]
+    )
+
+@client.on(events.CallbackQuery(pattern=r'^bulk_ans:(yes|no)$'))
+async def bulk_answer(event):
+    user = event.query.user_id
+    if user not in bulk_sessions:
+        return await event.answer(alert="No propagation in progress.")
+
+    answer = event.data.decode().split(":",1)[1]
+    state = bulk_sessions[user]
+    items, idx = state["items"], state["index"]
+    current = items[idx]
+
+    # handle confirm/skip
+    if answer == "yes":
+        try:
+            organizer.safe_rename(current["src"], current["dest"])
+            # derive metadata
+            dest_stem = Path(current["dest"]).stem
+            title = dest_stem.split(" - ")[0]
+            manual_entries = [r for r in organized_tbl.all() if r.get("method","manual")=="manual"]
+            last_manual = sorted(manual_entries, key=lambda r: r["timestamp"], reverse=True)[0]
+            category = last_manual["category"]
+            organizer.record_organized({
+                "path": str(current["dest"]),
+                "title": title,
+                "category": category,
+                "year": None,
+                "season": current["season"],
+                "episode": current["episode"],
+                "resolution": organizer.detect_resolution(current["src"]),
+                "organized_by": user,
+                "method": "auto",
+            })
+            await event.answer("Moved ✔️", alert=False)
+        except Exception as e:
+            await event.answer(f"Error: {e}", alert=True)
+    else:
+        await event.answer("Skipped ⏭️", alert=False)
+
+    # advance
+    state["index"] += 1
+    if state["index"] < len(items):
+        nxt = items[state["index"]]
+        await event.edit(
+            f"📦 Bulk propagation: {state['index']+1}/{len(items)}\n"
+            f"`{nxt['src'].name}` → `{nxt['dest'].name}`",
+            buttons=[
+                [Button.inline("✅ Yes", f"bulk_ans:yes"),
+                 Button.inline("❌ No",  f"bulk_ans:no")]
+            ]
+        )
+    else:
+        await event.edit("✅ Bulk propagation complete.", buttons=None)
+        del bulk_sessions[user]
+
 @client.on(events.NewMessage(pattern='^/organize$'))
 @admin_only
 async def organize_command(event):
@@ -1184,7 +1307,9 @@ async def pick_file(event):
       [ Button.inline("Movie","org_cat:movie"), Button.inline("TV","org_cat:tv") ],
       [ Button.inline("Anime","org_cat:anime"), Button.inline("Skip","org_cat:skip") ]
     ]
-    await event.edit(f"🗂️ File: {file_path.name}\nSelect category:", buttons=kb)
+    # confirm selection
+    await event.respond(f"🔍 Selected file: `{file_path.name}`\nDetected resolution: `{res}`", parse_mode="markdown")
+    await event.edit(f"🗂️ File: {file_path.name}\nSelect category:", buttons=kb)  
 
 @client.on(events.CallbackQuery(pattern=r'org_cat:(\w+)'))
 async def pick_category(event):
