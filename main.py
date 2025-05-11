@@ -113,9 +113,9 @@ stats_tbl   = db.table("stats")
 organized_tbl = db.table("organized")
 error_log_tbl = db.table("error_log")
 
-# Fuzzy‑matching thresholds
-HIGH_CONFIDENCE = 0.8  # auto‑accept
-LOW_CONFIDENCE  = 0.6  # auto‑reject
+# Fuzzy-matching thresholds (configurable via ENV, defaults 0.6/0.8)
+LOW_CONFIDENCE  = float(os.getenv("LOW_CONFIDENCE", "0.6"))   # below this → OTHER
+HIGH_CONFIDENCE = float(os.getenv("HIGH_CONFIDENCE", "0.8"))  # at or above this → auto-rename
 
 # Create a shared cache for TMDb searches: up to 500 entries, TTL 1 hour
 tmdb_cache = TTLCache(maxsize=500, ttl=3600)
