@@ -6,3 +6,5 @@ tinydb==4.8.2
 guessit==3.2.0
 python-magic==0.4.27
 cachetools==5.5.2
+tenacity==9.1.2
+async_timeout==5.0.1
