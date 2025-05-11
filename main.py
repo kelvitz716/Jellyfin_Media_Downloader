@@ -1119,43 +1119,56 @@ download_manager = DownloadManager()
 SESSION_NAME = Path(os.getenv("SESSION_NAME", "./data/jellyfin/sessions/jellyfin")).expanduser().resolve()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-def build_queue_message():
+def build_queue_message(page: int = 1, per_page: int = 10):
     """
-    Returns (text, buttons) for the current download queue,
-    so both /queue and the cancel callback can share it.
+    Returns (text, buttons) for the /queue response.
+      • page: 1-based page index
+      • per_page: items per page
     """
-    status = download_manager.get_queue_status()
-    active = status["active"]
-    queued = status["queued"]
+    status   = download_manager.get_queue_status()
+    active   = status["active"]    # list of (msg_id, filename, progress)
+    queued   = status["queued"]    # list of (pos, msg_id, filename, size)
 
-    # Build text
-    lines = [
-        "📋 DOWNLOAD QUEUE STATUS\n",
-        f"⏳ Active downloads: {len(active)}/{download_manager.max_concurrent}",
-        f"🔄 Queued files: {len(queued)}\n",
-    ]
+    lines = [f"🗒️ **Download Queue (page {page})**\n"]
+
+    # Currently downloading
     if active:
-        lines.append("🔽 CURRENTLY DOWNLOADING:")
-        for i, (_, fn, prog) in enumerate(active, 1):
-            lines.append(f"{i}️⃣ {fn} ({prog:.0f}% complete)")
+        lines.append("▶️ **Now:**")
+        for i, (_mid, fn, prog) in enumerate(active, 1):
+            filled = min(int(prog // 10), 10)
+            bar    = "[" + "█"*filled + "─"*(10-filled) + f"] {prog:.0f}%"
+            lines.append(f"{i}. `{fn}`  {bar}")
         lines.append("")
-    if queued:
-        lines.append("⏭️ NEXT IN QUEUE:")
-        for i, (_, _, fn, sz) in enumerate(queued, 1):
-            lines.append(f"{i}. {fn} ({humanize.naturalsize(sz)})")
-    lines.append("\n🛑 To cancel: press ❌ next to the file")
-    text = "\n".join(lines)
+    else:
+        lines.append("▶️ **Now:** _idle_\n")
 
-    # Build buttons
+    # Upcoming (paginated)
+    start = (page-1)*per_page
+    page_items = queued[start : start+per_page]
+    if page_items:
+        lines.append("⬇️ **Up next:**")
+        for idx, (_pos, _mid, fn, sz) in enumerate(page_items, start+1):
+            lines.append(f"{idx}. `{fn}` ({humanize.naturalsize(sz)})")
+    else:
+        lines.append("✅ No more items in queue.")
+
+    # Build inline buttons: cancel + “More →”
     buttons = []
-    for msg_id, fn, _ in active:
-        disp = (fn[:20] + "...") if len(fn) > 20 else fn
-        buttons.append([Button.inline(f"❌ Cancel: {disp}", f"cancel_{msg_id}")])
-    for _, msg_id, fn, _ in queued:
-        disp = (fn[:20] + "...") if len(fn) > 20 else fn
-        buttons.append([Button.inline(f"❌ Cancel: {disp}", f"cancel_{msg_id}")])
+    # Cancel buttons for active + queued
+    for mid, fn, _ in [(mid, fn, _) for mid,fn,_ in active] \
+                   + [(mid, fn, _) for _,mid,fn,_ in page_items]:
+        disp = fn if len(fn) <= 20 else fn[:17] + "..."
+        buttons.append([ Button.inline(f"❌ Cancel: {disp}", f"cancel_{mid}") ])
 
-    return text, buttons
+    # “More” button if further pages exist
+    total_queued = len(queued)
+    if total_queued > start + per_page:
+        next_page = page + 1
+        buttons.append([
+            Button.inline(f"More (page {next_page})", data=f"queue:{next_page}")
+        ])
+
+    return "\n".join(lines), buttons
 
 # Create a single organizer instance (so it reuses the same TinyDB tables, etc.)
 organizer = InteractiveOrganizer()
@@ -1676,18 +1689,24 @@ async def start_command(event):
         "👋 Welcome to the Jellyfin Media Downloader Bot!\n\n"
         "Send me any media file and I will download it to your Jellyfin library.\n\n"
         "📂 COMMANDS:\n"
-        "/start - Show this welcome message\n"
-        "/stats - 📊 Show download statistics\n"
-        "/queue - 📋 View current download queue\n"
-        "/test - 🔍 Run system test\n"
-        "/help - ❓ Show usage help\n\n"
-        "/users - 👥 View total unique users (admin only)\n"
-        "/organize - 🗂️ Organize files into categories (admin only)\n"
-        "/shutdown - 🔌 Gracefully shut down the bot (admin only)\n\n"
+        "/start      - Show this welcome message\n"
+        "/help       - Show usage help\n"
+        "/stats      - 📊 Show download statistics\n"
+        "/status     - 📊 Alias for /stats\n"
+        "/queue      - 📋 View current download queue\n"
+        "/test       - 🔍 Run system test\n"
+        "\n"
+        "🚀 Admin commands:\n"
+        "/organize   - 🗂️ Organize files into categories\n"
+        "/history    - 📜 View organize history\n"
+        "/propagate  - 📦 Bulk-propagate episodes\n"
+        "/users      - 👥 View total unique users\n"
+        "/shutdown   - 🔌 Gracefully shut down the bot\n"
+        "\n"
         "📱 SUPPORTED FORMATS:\n"
-        "🎬 Videos - MP4, MKV, AVI, etc.\n"
-        "🎵 Audio - MP3, FLAC, WAV, etc.\n"
-        "📄 Documents - PDF, ZIP, etc."
+        "• 🎬 Videos: MP4, MKV, AVI, etc.\n"
+        "• 🎵 Audio: MP3, FLAC, WAV, etc.\n"
+        "• 📄 Documents: PDF, ZIP, etc."
     )
 
 @client.on(events.NewMessage(pattern='/stats|/status'))
@@ -1752,16 +1771,31 @@ async def stats_command(event):
         f"⏳ Current status: {active_count} active, {queued_count} queued"
     )
 
-@client.on(events.NewMessage(pattern='/queue'))
+@client.on(events.NewMessage(pattern=r'^/queue(?:\s+(\d+))?$'))
 async def queue_command(event):
     if event.sender_id not in all_users:
         all_users.add(event.sender_id)
         save_active_users({event.sender_id})
+    # parse optional page argument
+    page_arg = event.pattern_match.group(1)
+    page = int(page_arg) if page_arg and page_arg.isdigit() else 1
 
-    text, buttons = build_queue_message()
-    # If there are buttons, send with them; else without
-    await event.respond(text, buttons=buttons if buttons else None)
+    text, buttons = build_queue_message(page=page)
+    await event.respond(text,
+                        buttons=buttons or None,
+                        parse_mode='md')
 
+@client.on(events.CallbackQuery(data=re.compile(r'^queue:(\d+)$')))
+async def queue_pagination(event):
+    """
+    Handle “More (page N)” taps by editing the original message.
+    """
+    page = int(event.data_match.group(1))
+    text, buttons = build_queue_message(page=page)
+    await event.edit(text,
+                     buttons=buttons or None,
+                     parse_mode='md')
+    
 @client.on(events.NewMessage(pattern='/test'))
 async def test_command(event):
     if event.sender_id not in all_users:

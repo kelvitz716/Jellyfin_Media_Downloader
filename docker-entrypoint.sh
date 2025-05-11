@@ -9,5 +9,8 @@ done
 # Ensure the bot user (UID 1000) owns everything under /data/jellyfin
 chown -R 1000:1000 /data/jellyfin
 
+# Make sure all dirs (and future files) are writable by UID 1000
+chmod -R u+rwX /data/jellyfin
+
 # Drop privileges and exec the bot
 exec gosu 1000:1000 python main.py
