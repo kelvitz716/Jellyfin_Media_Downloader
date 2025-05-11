@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import humanize
 import aiohttp
 import shutil
-import magic
+from tmdbv3api import TMDb, Movie, TV
 import mimetypes
 from guessit import guessit
 from difflib import SequenceMatcher
@@ -41,11 +41,34 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
-# Bot Configuration
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
+REQUIRED_ENV = {
+    'API_ID': {'val': None, 'required': True},
+    'API_HASH': {'val': None, 'required': True},
+    'BOT_TOKEN': {'val': None, 'required': True},
+    'TMDB_API_KEY': {'val': None, 'required': False},  # metadata optional
+}
+
+# Maximum download duration (seconds); default 2 hours
+MAX_DOWNLOAD_DURATION = int(os.getenv("MAX_DOWNLOAD_DURATION", "7200"))
+
+# load and validate env vars
+print("Loading environment variables...")
+for name, meta in REQUIRED_ENV.items():
+    val = os.getenv(name)
+    meta['val'] = val
+    if val:
+        status = 'OK'
+    else:
+        status = 'MISSING' if meta['required'] else 'DISABLED'
+    print(f"  {name}: {status}")
+    if status == 'MISSING':
+        sys.exit(1)
+
+# assign for backward compatibility
+API_ID = REQUIRED_ENV['API_ID']['val']
+API_HASH = REQUIRED_ENV['API_HASH']['val']
+BOT_TOKEN = REQUIRED_ENV['BOT_TOKEN']['val']
+TMDB_API_KEY = REQUIRED_ENV['TMDB_API_KEY']['val']
 # Admin IDs: comma-separated in ENV
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x}
 
@@ -57,8 +80,16 @@ TV_DIR       = Path(os.getenv("TV_DIR", BASE_DIR / "TV")).expanduser()
 ANIME_DIR    = Path(os.getenv("ANIME_DIR", BASE_DIR / "Anime")).expanduser()
 MUSIC_DIR    = Path(os.getenv("MUSIC_DIR", BASE_DIR / "Music")).expanduser()
 OTHER_DIR    = Path(os.getenv("OTHER_DIR", BASE_DIR / "Other")).expanduser()
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+def create_dir_safely(path: Path):
+    if not path.exists():
+        logger.info(f"Creating directory: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+
+# Create essential directories with retry logic
 for d in (BASE_DIR, DOWNLOAD_DIR, MOVIES_DIR, TV_DIR, ANIME_DIR, MUSIC_DIR, OTHER_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+    create_dir_safely(d)
 
 # STDOUT handler
 sh = logging.StreamHandler(sys.stdout)
@@ -113,6 +144,14 @@ organize_sessions = defaultdict(dict)
 
 # In-memory state for bulk propagation
 bulk_sessions = defaultdict(lambda: {"items": [], "index": 0})
+
+# Initialize tmdbv3api client (blocking under the hood)
+tmdb = TMDb()
+tmdb.api_key = TMDB_API_KEY
+tmdb.language = 'en'
+
+_movie = Movie()
+_tv    = TV()
 
 # Helper functions
 
@@ -498,17 +537,24 @@ class DownloadManager:
 
     async def cancel_download(self, message_id):
         async with self.lock:
-            # Check if it's in active downloads
+            # 1) Active download cancellation
             if message_id in self.active_downloads:
-                task = self.active_downloads[message_id]
+                task = self.active_downloads.pop(message_id)
                 await task.cancel()
-                del self.active_downloads[message_id]
+
+                # Immediately start the next queued task, if any
+                if self.queued_downloads:
+                    next_task = self.queued_downloads.pop(0)
+                    self.active_downloads[next_task.message_id] = next_task
+                    stats.update_peak_concurrent(len(self.active_downloads))
+                    asyncio.create_task(self._process_download(next_task))
+
                 return True
 
-            # Check if it's in the queue
-            for i, task in enumerate(self.queued_downloads):
+            # 2) Remove from queue if pending
+            for idx, task in enumerate(self.queued_downloads):
                 if task.message_id == message_id:
-                    self.queued_downloads.pop(i)
+                    self.queued_downloads.pop(idx)
                     await task.cancel()
                     return True
 
@@ -542,6 +588,7 @@ class DownloadTask:
         self.process_message = None
         # Identify large files upfront and save as instance variable
         self.large_file = file_size > 500 * 1024 * 1024  # > 500 MB
+        self.max_duration = MAX_DOWNLOAD_DURATION
         self.download_manager = download_manager
         self.queue_position = None
         self.last_update_time = None
@@ -589,28 +636,26 @@ class DownloadTask:
                 f"ℹ️ Status updates every {update_interval}"
             )
 
-            # Start the download
-            await self.client.download_media(
-                self.event.message,
-                self.download_path,
-                progress_callback=self.progress_callback
-            )
+            # Start the download, but enforce a max-duration
+            try:
+                async with timeout(self.max_duration):
+                    await self.client.download_media(
+                        self.event.message,
+                        self.download_path,
+                        progress_callback=self.progress_callback
+                    )
+            except asyncio.TimeoutError:
+                # Auto-cancel on timeout
+                reason = humanize.precisedelta(timedelta(seconds=self.max_duration))
+                logger.warning(f"Download {self.filename} timed out after {reason}")
+                await self.event.respond(
+                    f"⚠️ Download timed out after {reason}. Cancelling automatically."
+                )
+                await self.cancel()
+                BotStats.record_download(self.event.sender_id, 0, 0, success=False)
+                return False
 
-            if not self.cancelled:
-                # ── Post-download extension fix ────────────────────────────────
-                #try:
-                #    fp = Path(self.download_path)
-                #    if fp.exists():
-                #        mime = magic.from_file(str(fp), mime=True)
-                #        new_ext = mimetypes.guess_extension(mime) or self.ext
-                #        if new_ext != self.ext:
-                #            new_path = fp.with_suffix(new_ext)
-                #            fp.rename(new_path)
-                #            self.download_path = str(new_path)
-                #            self.ext = new_ext
-                #except Exception as e:
-                #    logger.warning(f"Post-download magic sniff failed for {self.download_path}: {e}")
-
+            if not self.cancelled:                
                 # Record completion time & stats
                 self.end_time = time.time()
                 duration = self.end_time - self.start_time
@@ -997,105 +1042,57 @@ class MediaProcessor:
         # Always reuse the global session if none provided
         self.session = session or aiohttp_session
 
-    async def fetch_json(self, url: str, params: dict) -> dict:
-        params["api_key"] = self.tmdb_api_key
-        async with self.session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
     async def search_tmdb(self) -> dict:
         """
-        Parse filename with GuessIt and query TMDb for movie or TV episode.
+        Use tmdbv3api to lookup movie or TV episode based on GuessIt.
         """
-        info       = guessit(self.filename)
-        media_type = info.get('type')
-        title      = info.get('title')
+        info = guessit(self.filename)
+        title = info.get('title')
         if not title:
             raise ValueError(f"Could not extract title from '{self.filename}'")
 
-        # TV episode lookup
-        if media_type == 'episode':
+        loop = asyncio.get_running_loop()
+
+        # TV episode
+        if info.get('type') == 'episode':
             season  = info.get('season', 1)
             episode = info.get('episode', 1)
-            logger.info("Detected TV: %s S%02dE%02d", title, season, episode)
-            return await self.tmdb_search_tv(title, season, episode)
+            # run blocking .search in thread
+            results = await loop.run_in_executor(None, lambda: _tv.search(title))
+            if not results:
+                return {}
+            show = results[0]
+            # fetch specific episode details (blocking)
+            try:
+                ep_data = await loop.run_in_executor(
+                    None,
+                    lambda: _tv.tv_episode(show.id, season, episode)
+                )
+            except Exception:
+                ep_data = {}
+            return {
+                "type":    "tv",
+                "title":   show.name,
+                "season":  season,
+                "episode": episode,
+                "is_anime": False,  # keyword lookup not in tmdbv3api
+                "tmdb_id": show.id,
+            }
 
-        # Movie lookup (or fallback)
-        year = info.get('year') if media_type == 'movie' else None
-        logger.info("Detected Movie: %s (%s)", title, year)
-        return await self.tmdb_search_movie(title, year)
-
-    async def tmdb_search_movie(self, title: str, year: int = None) -> dict:
-        """Cached movie lookup (now sends API key correctly)."""
-        key = f"movie:{title}:{year}"
-        if key in tmdb_cache:
-            return tmdb_cache[key]
-        
-        search_url = f"{self.TMDB_URL}/search/movie"
-        params = {"query": title}
-        if year:
-            params["year"] = year
-
-        try:
-            # fetch_json will inject the api_key param
-            data = await self.fetch_json(search_url, params)
-        except Exception as e:
-            logger.error(f"TMDb movie search error: {e}")
+        # Movie
+        year = info.get('year') if info.get('type') == 'movie' else None
+        results = await loop.run_in_executor(None, lambda: _movie.search(title))
+        if not results:
             return {}
-
-        else:
-            if data.get("results"):
-                first = data["results"][0]
-                is_anime = await self.check_anime_tag(first["id"], "movie")
-                result = {
-                    "type": "movie",
-                    "title": first.get("title", title),
-                    "year": first.get("release_date", "")[:4],
-                    "tmdb_id": first["id"],
-                    "is_anime": is_anime,
-                }
-            else:
-                result = {}
-
-        tmdb_cache[key] = result
-        return result
-
-    
-    async def tmdb_search_tv(self, title: str, season: int, episode: int) -> dict:
-        """Cached TV lookup."""
-        key = f"tv:{title}:{season}:{episode}"
-        if key in tmdb_cache:
-            return tmdb_cache[key]
-        
-        search_url = f"{self.TMDB_URL}/search/tv"
-        try:
-            data = await self.fetch_json(search_url, {"query": title})
-            results = data.get("results", [])
-        except Exception as e:
-            logger.error(f"TMDb TV search error: {e}")
-            return {}
-        except aiohttp.ClientError as e:
-            logger.error(f"TMDb TV search network error: {e}")
-            return {}
-        
-        else:
-            if data.get("results"): 
-                show_id = results[0]["id"]
-                is_anime = await self.check_anime_tag(show_id, "tv")
-                return {
-                    "type": "tv",
-                    "title": results[0].get("name", title),
-                    "season": season,
-                    "episode": episode,
-                    "is_anime": is_anime,
-                    "tmdb_id": show_id,
-                }
-            else:
-                result = {}
-
-        tmdb_cache[key] = result
-        return result
-    
+        m = results[0]
+        return {
+            "type":     "movie",
+            "title":    m.title,
+            "year":     m.release_date[:4] if getattr(m, 'release_date', None) else None,
+            "is_anime": False,
+            "tmdb_id":  m.id,
+        }
+   
     async def check_anime_tag(self, tmdb_id: int, media_type: str) -> bool:
         """Check if 'anime' exists in TMDb keywords"""
         endpoint = f"{self.TMDB_URL}/{media_type}/{tmdb_id}/keywords"
@@ -1466,48 +1463,151 @@ async def show_organized_page(event, offset=0):
     text = f"📁 Recently organized files ({offset+1}–{offset+len(page)} of {total}):"
     await event.respond(text, buttons=buttons)
 
-# /history command
 @client.on(events.NewMessage(pattern=r'^/history$'))
 @admin_only
 async def history_command(event):
-    await show_history_page(event, offset=0)
+    await show_history_page(event, offset=0, detail_eid=None)
 
 @client.on(events.CallbackQuery(pattern=r'^hist_page:(\d+)$'))
 async def history_page_callback(event):
-    offset = int(event.data.decode().split(":")[1])
-    await show_history_page(event, offset=offset)
+    offset = int(event.pattern_match.group(1)) # Use pattern_match for safety
+    # Call show_history_page to display the list view for the new offset
+    await show_history_page(event, offset=offset, detail_eid=None)
 
-async def show_history_page(event, offset=0):
-    # All entries, manual + auto
-    all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp",""), reverse=True)
-    total = len(all_sorted)
-    page = all_sorted[offset:offset+10]
-    if not page:
-        return await event.respond("📁 No history available.")
+# New callback for viewing item details
+@client.on(events.CallbackQuery(pattern=r'^hist_detail:(\d+):(\d+)$')) # eid:offset
+async def history_detail_callback(event):
+    eid = int(event.pattern_match.group(1))
+    offset = int(event.pattern_match.group(2)) # The offset of the list page we came from
+    # Call show_history_page to display the detail view
+    await show_history_page(event, offset=offset, detail_eid=eid)
 
-    buttons = []
-    for entry in page:
+async def show_history_page(event, offset=0, detail_eid=None):
+    all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp", ""), reverse=True)
+    total_entries = len(all_sorted)
+    entries_per_page = 5
+
+    # --- DETAIL VIEW ---
+    if detail_eid:
+        entry = organized_tbl.get(doc_id=detail_eid)
+        if not entry:
+            await event.answer("⚠️ Entry not found.", alert=True)
+            # Fallback to list view at the current offset
+            return await show_history_page(event, offset=offset, detail_eid=None)
+
         name = Path(entry['path']).name
         ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
-        method = entry.get("method","manual").capitalize()
-        eid = entry.doc_id
-        buttons.append([
-            Button.inline(f"📄 {name}", f"noop:{eid}"),
-            Button.inline(f"{method}", f"noop:{eid}"),
-            Button.inline("🔁", f"reorg:{eid}"),
-            Button.inline("🗑️", f"delorg:{eid}"),
-            Button.inline(f"🕓 {ts}", f"noop:{eid}")
-        ])
+        method = entry.get("method", "manual").capitalize()
+        category = entry.get("category", "N/A").capitalize()
+        resolution = entry.get("resolution", "N/A")
+        year = entry.get("year", "")
+        season = entry.get("season")
+        episode = entry.get("episode")
 
-    nav = []
-    if offset > 0:
-        nav.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset-10)}"))
-    if offset + 10 < total:
-        nav.append(Button.inline("▶️ Next", f"hist_page:{offset+10}"))
-    if nav:
-        buttons.append(nav)
+        title_display = entry.get('title', Path(name).stem)
+        if year and category.lower() == 'movie':
+            title_display += f" ({year})"
+        elif season is not None and episode is not None and category.lower() != 'movie': # Check if category is not movie and season/ep exist
+            title_display += f" - S{int(season):02d}E{int(episode):02d}"
 
-    await event.respond(f"🕓 Recent history ({offset+1}–{offset+len(page)} of {total}):", buttons=buttons)
+
+        text = f"📜 **History Item Details**\n\n" \
+               f"🎬 **Title:** `{title_display}`\n" \
+               f"📄 **Original File:** `{name}`\n" \
+               f"⚙️ **Method:** `{method}`\n" \
+               f"🗂️ **Category:** `{category}`\n"
+        if resolution and resolution != "N/A":
+             text += f"📺 **Resolution:** `{resolution}`\n"
+        text += f"🕓 **Time:** _{ts}_"
+
+        buttons = [
+            [Button.inline(f"🔁 Reorganize", f"reorg:{detail_eid}"),
+             Button.inline(f"🗑️ Delete Entry", f"delorg:{detail_eid}")],
+            [Button.inline(f"◀️ Back to History (Page {(offset // entries_per_page) + 1})", f"hist_page:{offset}")]
+        ]
+        
+        try:
+            # This view is typically reached via a CallbackQuery, so event.edit() is appropriate.
+            await event.edit(text, buttons=buttons, parse_mode="markdown")
+        except Exception as e:
+            logger.error(f"Error editing history detail view: {e}")
+            await event.answer("Error displaying details. Please try again.", alert=True)
+
+    # --- LIST VIEW ---
+    else:
+        if offset >= total_entries and offset > 0:
+            offset = max(0, total_entries - entries_per_page) 
+            if offset < 0: offset = 0
+
+        page_entries = all_sorted[offset : offset + entries_per_page]
+
+        if not page_entries and total_entries > 0:
+             offset = max(0, total_entries - entries_per_page)
+             if offset < 0: offset = 0
+             page_entries = all_sorted[offset : offset + entries_per_page]
+        elif not page_entries and total_entries == 0:
+             message_text = "📁 No history available."
+             if isinstance(event, events.CallbackQuery.Event):
+                try:
+                    await event.edit(message_text, buttons=None)
+                except Exception as e:
+                    logger.error(f"Error editing to 'No history': {e}")
+                    await event.answer("No history available.") # Answer callback
+             elif isinstance(event, events.NewMessage.Event):
+                await event.respond(message_text)
+             return
+
+        current_page_num = (offset // entries_per_page) + 1
+        total_pages = (total_entries + entries_per_page - 1) // entries_per_page
+        if total_pages == 0 and total_entries > 0 : total_pages = 1
+
+        message_text = f"📜 **History - Page {current_page_num} of {total_pages}** ({total_entries} total entries)\n\n"
+        action_buttons_rows = []
+
+        for i, entry in enumerate(page_entries):
+            name = Path(entry['path']).name
+            ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
+            method = entry.get("method", "manual").capitalize()
+            eid = entry.doc_id
+            
+            title = entry.get('title', Path(name).stem)
+            display_name = title if len(title) < 35 else title[:32] + "..."
+
+            message_text += f"**{offset + i + 1}.** `{display_name}`\n" \
+                            f"   └─ _{ts}_ `[{method}]`\n"
+            action_buttons_rows.append(
+                [Button.inline(f"🔍 Details for #{offset + i + 1}", f"hist_detail:{eid}:{offset}")]
+            )
+
+        nav_row = []
+        if offset > 0:
+            nav_row.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset - entries_per_page)}"))
+        if offset + entries_per_page < total_entries:
+            nav_row.append(Button.inline("▶️ Next", f"hist_page:{offset + entries_per_page}"))
+        
+        if nav_row:
+            action_buttons_rows.append(nav_row)
+
+        # Send or Edit the message based on the event type
+        if isinstance(event, events.CallbackQuery.Event):
+            try:
+                await event.edit(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+            except Exception as e:
+                # Handle "message is not modified" error specifically if needed, or log others
+                if "Message actual text is empty" in str(e) or "message to edit not found" in str(e): # Example specific error checks
+                    logger.warning(f"Attempted to edit but failed (possibly deleted message or bad state): {e}")
+                    # May need to send a new message if edit context is lost, but be careful.
+                    # For now, just answer the callback.
+                    await event.answer("Could not update view. Please try /history again.", alert=True)
+                elif "message not modified" not in str(e).lower(): # Don't log "not modified" as an error
+                    logger.error(f"Error editing history list view: {e}")
+                    await event.answer("Error updating list.", alert=True)
+                else:
+                    await event.answer() # Acknowledge if not modified
+        elif isinstance(event, events.NewMessage.Event):
+            await event.respond(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+        else:
+            logger.warning(f"show_history_page called with unexpected event type: {type(event)}")
 
 @client.on(events.CallbackQuery(pattern=r'reorg:(\d+)'))
 async def reorganize_entry(event):
