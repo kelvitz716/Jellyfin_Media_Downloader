@@ -1,16 +1,11 @@
-version: "3.8"
+version: ""
+
 services:
   jellyfin_bot:
     build: .
     container_name: jellyfin_bot
-    env_file: [.env]
+    env_file:
+      - .env
     volumes:
-      - ./data/jellyfin:/data/jellyfin        # sessions, DB, downloads, logs
-      - jellyfin-data:/data/jellyfin
+      - ./data/jellyfin:/data/jellyfin
     restart: unless-stopped
-
-  healthcheck:
-  test: ["CMD", "pgrep", "-f", "main.py"]
-  interval: 30s
-  timeout: 10s
-  retries: 3

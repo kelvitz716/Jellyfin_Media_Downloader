@@ -73,13 +73,15 @@ TMDB_API_KEY = REQUIRED_ENV['TMDB_API_KEY']['val']
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x}
 
 # Base directory for downloads & DB
-BASE_DIR    = Path(os.getenv("BASE_DIR","/data/jellyfin")).expanduser()
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "Downloads")).expanduser()
-MOVIES_DIR   = Path(os.getenv("MOVIES_DIR", BASE_DIR / "Movies")).expanduser()
-TV_DIR       = Path(os.getenv("TV_DIR", BASE_DIR / "TV")).expanduser()
-ANIME_DIR    = Path(os.getenv("ANIME_DIR", BASE_DIR / "Anime")).expanduser()
-MUSIC_DIR    = Path(os.getenv("MUSIC_DIR", BASE_DIR / "Music")).expanduser()
-OTHER_DIR    = Path(os.getenv("OTHER_DIR", BASE_DIR / "Other")).expanduser()
+BASE_DIR    = Path(os.getenv("BASE_DIR","/data/jellyfin")).expanduser().resolve()
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "Downloads")).expanduser().resolve()
+MOVIES_DIR   = Path(os.getenv("MOVIES_DIR", BASE_DIR / "Movies")).expanduser().resolve()
+TV_DIR       = Path(os.getenv("TV_DIR", BASE_DIR / "TV")).expanduser().resolve()
+ANIME_DIR    = Path(os.getenv("ANIME_DIR", BASE_DIR / "Anime")).expanduser().resolve()
+MUSIC_DIR    = Path(os.getenv("MUSIC_DIR", BASE_DIR / "Music")).expanduser().resolve()
+OTHER_DIR    = Path(os.getenv("OTHER_DIR", BASE_DIR / "Other")).expanduser().resolve()
+LOG_DIR = Path(os.getenv("LOG_DIR", BASE_DIR / "logs")).expanduser().resolve()
+SESSION_NAME = Path(os.getenv("SESSION_NAME", BASE_DIR / "sessions/jellyfin")).expanduser().resolve()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
 def create_dir_safely(path: Path):
@@ -1114,7 +1116,7 @@ BotStats.load_all()
 download_manager = DownloadManager()
 
 # Telegram client (dynamic session name)
-SESSION_NAME = os.getenv("SESSION_NAME","bot_session")
+SESSION_NAME = Path(os.getenv("SESSION_NAME", "./data/jellyfin/sessions/jellyfin")).expanduser().resolve()
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 def build_queue_message():
@@ -1776,7 +1778,7 @@ async def test_command(event):
     }
     dir_checks = []
     for name, path in directories.items():
-        if path.exists() and path.access(os.R_OK | os.W_OK):
+        if path.exists() and os.access(path, os.R_OK | os.W_OK):
             free = shutil.disk_usage(path).free
             dir_checks.append(f"✅ {name}: OK ({humanize.naturalsize(free)} free)") # Use humanize
         else:
