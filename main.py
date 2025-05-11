@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import humanize
 import aiohttp
 import shutil
-import magic
+from tmdbv3api import TMDb, Movie, TV
 import mimetypes
 from guessit import guessit
 from difflib import SequenceMatcher
@@ -113,6 +113,14 @@ organize_sessions = defaultdict(dict)
 
 # In-memory state for bulk propagation
 bulk_sessions = defaultdict(lambda: {"items": [], "index": 0})
+
+# Initialize tmdbv3api client (blocking under the hood)
+tmdb = TMDb()
+tmdb.api_key = TMDB_API_KEY
+tmdb.language = 'en'
+
+_movie = Movie()
+_tv    = TV()
 
 # Helper functions
 
@@ -997,105 +1005,57 @@ class MediaProcessor:
         # Always reuse the global session if none provided
         self.session = session or aiohttp_session
 
-    async def fetch_json(self, url: str, params: dict) -> dict:
-        params["api_key"] = self.tmdb_api_key
-        async with self.session.get(url, params=params) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-
     async def search_tmdb(self) -> dict:
         """
-        Parse filename with GuessIt and query TMDb for movie or TV episode.
+        Use tmdbv3api to lookup movie or TV episode based on GuessIt.
         """
-        info       = guessit(self.filename)
-        media_type = info.get('type')
-        title      = info.get('title')
+        info = guessit(self.filename)
+        title = info.get('title')
         if not title:
             raise ValueError(f"Could not extract title from '{self.filename}'")
 
-        # TV episode lookup
-        if media_type == 'episode':
+        loop = asyncio.get_running_loop()
+
+        # TV episode
+        if info.get('type') == 'episode':
             season  = info.get('season', 1)
             episode = info.get('episode', 1)
-            logger.info("Detected TV: %s S%02dE%02d", title, season, episode)
-            return await self.tmdb_search_tv(title, season, episode)
+            # run blocking .search in thread
+            results = await loop.run_in_executor(None, lambda: _tv.search(title))
+            if not results:
+                return {}
+            show = results[0]
+            # fetch specific episode details (blocking)
+            try:
+                ep_data = await loop.run_in_executor(
+                    None,
+                    lambda: _tv.tv_episode(show.id, season, episode)
+                )
+            except Exception:
+                ep_data = {}
+            return {
+                "type":    "tv",
+                "title":   show.name,
+                "season":  season,
+                "episode": episode,
+                "is_anime": False,  # keyword lookup not in tmdbv3api
+                "tmdb_id": show.id,
+            }
 
-        # Movie lookup (or fallback)
-        year = info.get('year') if media_type == 'movie' else None
-        logger.info("Detected Movie: %s (%s)", title, year)
-        return await self.tmdb_search_movie(title, year)
-
-    async def tmdb_search_movie(self, title: str, year: int = None) -> dict:
-        """Cached movie lookup (now sends API key correctly)."""
-        key = f"movie:{title}:{year}"
-        if key in tmdb_cache:
-            return tmdb_cache[key]
-        
-        search_url = f"{self.TMDB_URL}/search/movie"
-        params = {"query": title}
-        if year:
-            params["year"] = year
-
-        try:
-            # fetch_json will inject the api_key param
-            data = await self.fetch_json(search_url, params)
-        except Exception as e:
-            logger.error(f"TMDb movie search error: {e}")
+        # Movie
+        year = info.get('year') if info.get('type') == 'movie' else None
+        results = await loop.run_in_executor(None, lambda: _movie.search(title))
+        if not results:
             return {}
-
-        else:
-            if data.get("results"):
-                first = data["results"][0]
-                is_anime = await self.check_anime_tag(first["id"], "movie")
-                result = {
-                    "type": "movie",
-                    "title": first.get("title", title),
-                    "year": first.get("release_date", "")[:4],
-                    "tmdb_id": first["id"],
-                    "is_anime": is_anime,
-                }
-            else:
-                result = {}
-
-        tmdb_cache[key] = result
-        return result
-
-    
-    async def tmdb_search_tv(self, title: str, season: int, episode: int) -> dict:
-        """Cached TV lookup."""
-        key = f"tv:{title}:{season}:{episode}"
-        if key in tmdb_cache:
-            return tmdb_cache[key]
-        
-        search_url = f"{self.TMDB_URL}/search/tv"
-        try:
-            data = await self.fetch_json(search_url, {"query": title})
-            results = data.get("results", [])
-        except Exception as e:
-            logger.error(f"TMDb TV search error: {e}")
-            return {}
-        except aiohttp.ClientError as e:
-            logger.error(f"TMDb TV search network error: {e}")
-            return {}
-        
-        else:
-            if data.get("results"): 
-                show_id = results[0]["id"]
-                is_anime = await self.check_anime_tag(show_id, "tv")
-                return {
-                    "type": "tv",
-                    "title": results[0].get("name", title),
-                    "season": season,
-                    "episode": episode,
-                    "is_anime": is_anime,
-                    "tmdb_id": show_id,
-                }
-            else:
-                result = {}
-
-        tmdb_cache[key] = result
-        return result
-    
+        m = results[0]
+        return {
+            "type":     "movie",
+            "title":    m.title,
+            "year":     m.release_date[:4] if getattr(m, 'release_date', None) else None,
+            "is_anime": False,
+            "tmdb_id":  m.id,
+        }
+   
     async def check_anime_tag(self, tmdb_id: int, media_type: str) -> bool:
         """Check if 'anime' exists in TMDb keywords"""
         endpoint = f"{self.TMDB_URL}/{media_type}/{tmdb_id}/keywords"
@@ -1466,48 +1426,145 @@ async def show_organized_page(event, offset=0):
     text = f"📁 Recently organized files ({offset+1}–{offset+len(page)} of {total}):"
     await event.respond(text, buttons=buttons)
 
-# /history command
 @client.on(events.NewMessage(pattern=r'^/history$'))
 @admin_only
 async def history_command(event):
-    await show_history_page(event, offset=0)
+    await show_history_page(event, offset=0, detail_eid=None)
 
 @client.on(events.CallbackQuery(pattern=r'^hist_page:(\d+)$'))
 async def history_page_callback(event):
-    offset = int(event.data.decode().split(":")[1])
-    await show_history_page(event, offset=offset)
+    offset = int(event.pattern_match.group(1)) # Use pattern_match for safety
+    # Call show_history_page to display the list view for the new offset
+    await show_history_page(event, offset=offset, detail_eid=None)
 
-async def show_history_page(event, offset=0):
+# New callback for viewing item details
+@client.on(events.CallbackQuery(pattern=r'^hist_detail:(\d+):(\d+)$')) # eid:offset
+async def history_detail_callback(event):
+    eid = int(event.pattern_match.group(1))
+    offset = int(event.pattern_match.group(2)) # The offset of the list page we came from
+    # Call show_history_page to display the detail view
+    await show_history_page(event, offset=offset, detail_eid=eid)
+
+async def show_history_page(event, offset=0, detail_eid=None):
     # All entries, manual + auto
     all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp",""), reverse=True)
-    total = len(all_sorted)
-    page = all_sorted[offset:offset+10]
-    if not page:
-        return await event.respond("📁 No history available.")
+    total_entries = len(all_sorted)
+    entries_per_page = 5  # Reduced items per page for a cleaner list view and button management
 
-    buttons = []
-    for entry in page:
+    # --- DETAIL VIEW ---
+    if detail_eid:
+        entry = organized_tbl.get(doc_id=detail_eid)
+        if not entry:
+            await event.answer("⚠️ Entry not found.", alert=True)
+            # Fallback to list view at the current offset
+            return await show_history_page(event, offset=offset, detail_eid=None)
+
         name = Path(entry['path']).name
         ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
         method = entry.get("method","manual").capitalize()
-        eid = entry.doc_id
-        buttons.append([
-            Button.inline(f"📄 {name}", f"noop:{eid}"),
-            Button.inline(f"{method}", f"noop:{eid}"),
-            Button.inline("🔁", f"reorg:{eid}"),
-            Button.inline("🗑️", f"delorg:{eid}"),
-            Button.inline(f"🕓 {ts}", f"noop:{eid}")
-        ])
+        category = entry.get("category", "N/A").capitalize()
+        resolution = entry.get("resolution", "N/A")
+        year = entry.get("year", "")
+        season = entry.get("season")
+        episode = entry.get("episode")
 
-    nav = []
-    if offset > 0:
-        nav.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset-10)}"))
-    if offset + 10 < total:
-        nav.append(Button.inline("▶️ Next", f"hist_page:{offset+10}"))
-    if nav:
-        buttons.append(nav)
+        title_display = entry.get('title', Path(name).stem)
+        if year and category.lower() == 'movie':
+            title_display += f" ({year})"
+        elif season and episode and category.lower() != 'movie': # Check if category is not movie
+            title_display += f" - S{season:02d}E{episode:02d}"
 
-    await event.respond(f"🕓 Recent history ({offset+1}–{offset+len(page)} of {total}):", buttons=buttons)
+        text = f"📜 **History Item Details**\n\n" \
+               f"🎬 **Title:** `{title_display}`\n" \
+               f"📄 **Original File:** `{name}`\n" \
+               f"⚙️ **Method:** `{method}`\n" \
+               f"🗂️ **Category:** `{category}`\n"
+        if resolution and resolution != "N/A":
+             text += f"📺 **Resolution:** `{resolution}`\n"
+        text += f"🕓 **Time:** _{ts}_"
+        buttons = [
+            [Button.inline(f"🔁 Reorganize", f"reorg:{detail_eid}"),
+             Button.inline(f"🗑️ Delete Entry", f"delorg:{detail_eid}")],
+            # Pass the original list offset back to the hist_page callback
+            [Button.inline(f"◀️ Back to History (Page {(offset // entries_per_page) + 1})", f"hist_page:{offset}")]
+         ]
+        
+        try:
+            await event.edit(text, buttons=buttons, parse_mode="markdown")
+        except Exception: # Fallback if edit fails (e.g. message too old, or not callback)
+            await event.respond(text, buttons=buttons, parse_mode="markdown")
+
+    # --- LIST VIEW ---
+    else:
+        # Handle potential empty page if entries were deleted
+        if offset >= total_entries and offset > 0: # If current offset is beyond available entries
+            offset = max(0, total_entries - entries_per_page) 
+            if offset < 0: offset = 0 # Ensure offset is not negative if total_entries < entries_per_page
+
+        page_entries = all_sorted[offset : offset + entries_per_page]
+
+        # If, after adjustment, the current page is still empty but there is data, try to go to the last valid page
+        if not page_entries and total_entries > 0: 
+             offset = max(0, total_entries - entries_per_page)
+             if offset < 0: offset = 0
+             page_entries = all_sorted[offset : offset + entries_per_page]
+        elif not page_entries and total_entries == 0: # No entries at all
+             msg_text = "📁 No history available."
+             if hasattr(event, 'edit') and event.message: # Check if event.message exists for edit
+                await event.edit(msg_text, buttons=None)
+             else: 
+                await event.respond(msg_text)
+             return
+
+        current_page_num = (offset // entries_per_page) + 1
+        total_pages = (total_entries + entries_per_page - 1) // entries_per_page
+        if total_pages == 0 and total_entries > 0 : total_pages = 1 # Ensure total_pages is at least 1 if there are entries
+
+        message_text = f"📜 **History - Page {current_page_num} of {total_pages}** ({total_entries} total entries)\n\n"
+        
+        action_buttons_rows = []
+
+        for i, entry in enumerate(page_entries):
+            name = Path(entry['path']).name
+            ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
+            method = entry.get("method", "manual").capitalize()
+            eid = entry.doc_id
+            
+            title = entry.get('title', Path(name).stem)
+            # Shorten filename if too long for display line
+            display_name = title if len(title) < 35 else title[:32] + "..."
+
+            message_text += f"**{offset + i + 1}.** `{display_name}`\n" \
+                            f"   └─ _{ts}_ `[{method}]`\n"
+            # Button to view details for this item. Pass current offset for "back" navigation.
+            action_buttons_rows.append(
+                [Button.inline(f"🔍 Details for #{offset + i + 1}", f"hist_detail:{eid}:{offset}")]
+            )
+
+        # Navigation buttons
+        nav_row = []
+        if offset > 0:
+            nav_row.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset - entries_per_page)}"))
+        if offset + entries_per_page < total_entries:
+            nav_row.append(Button.inline("▶️ Next", f"hist_page:{offset + entries_per_page}"))
+        
+        if nav_row:
+            action_buttons_rows.append(nav_row)
+
+        # Send or Edit the message
+        if hasattr(event, 'edit') and event.message: # Check if event.message exists for edit
+            try:
+                # Only edit if the content is different or buttons are different
+                # This simple check might not be perfect for button differences
+                if event.message.text != message_text or event.message.buttons != action_buttons_rows:
+                    await event.edit(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+            except Exception: 
+                # Fallback if edit fails for other reasons, or if it's already a history message and not a CallbackQuery from a different source
+                # A more robust check might be needed if event source varies significantly
+                if not event.message.text.startswith("📜 **History"):
+                     await event.respond(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+        else: # For /history command itself (NewMessage event) or if edit is not applicable
+            await event.respond(message_text, buttons=action_buttons_rows, parse_mode="markdown")
 
 @client.on(events.CallbackQuery(pattern=r'reorg:(\d+)'))
 async def reorganize_entry(event):
