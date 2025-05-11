@@ -1064,8 +1064,14 @@ async def organize_flow(event):
             new_name = f"{base}{ext}"
 
         dest = folder / new_name
-        shutil.move(str(fpath), str(dest))
-        await event.respond(f"✅ Moved to `{dest}`")
+        logger.info(f"Organize: moving `{fpath}` → `{dest}`")
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(fpath), str(dest))
+            await event.respond(f"✅ Moved to `{dest}`")
+        except Exception as e:
+            logger.error(f"Organize move failed: {e}", exc_info=True)
+            await event.respond(f"⚠️ Could not move file: {e}")
 
         organize_sessions.pop(user, None)
         await event.respond("🗂️ Send /organize to categorize another file, or /done to exit.")
