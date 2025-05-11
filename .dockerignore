@@ -14,3 +14,6 @@ filenames.txt
 sanitized_*.txt
 suggested_improvements.md
 data/jellyfin/
+/wheels/
+/*.tar
+/wheels

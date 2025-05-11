@@ -29,6 +29,9 @@ COPY . .
 # Prepare data directory and run as non-root
 RUN mkdir -p /data/jellyfin && chown -R 1000:1000 /data/jellyfin
 USER 1000
+RUN addgroup --gid 1000 bot && adduser --uid 1000 --gid 1000 --disabled-password bot
+USER bot
 
 # Launch the bot
-CMD ["python", "main.py"]
+ENTRYPOINT ["python", "main.py"]
+CMD []

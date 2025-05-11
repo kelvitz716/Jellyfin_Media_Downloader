@@ -6,4 +6,11 @@ services:
     env_file: [.env]
     volumes:
       - ./data/jellyfin:/data/jellyfin        # sessions, DB, downloads, logs
+      - jellyfin-data:/data/jellyfin
     restart: unless-stopped
+
+  healthcheck:
+  test: ["CMD", "pgrep", "-f", "main.py"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
