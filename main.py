@@ -1446,10 +1446,9 @@ async def history_detail_callback(event):
     await show_history_page(event, offset=offset, detail_eid=eid)
 
 async def show_history_page(event, offset=0, detail_eid=None):
-    # All entries, manual + auto
-    all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp",""), reverse=True)
+    all_sorted = sorted(organized_tbl.all(), key=lambda r: r.get("timestamp", ""), reverse=True)
     total_entries = len(all_sorted)
-    entries_per_page = 5  # Reduced items per page for a cleaner list view and button management
+    entries_per_page = 5
 
     # --- DETAIL VIEW ---
     if detail_eid:
@@ -1461,7 +1460,7 @@ async def show_history_page(event, offset=0, detail_eid=None):
 
         name = Path(entry['path']).name
         ts = humanize.naturaltime(datetime.fromisoformat(entry['timestamp']))
-        method = entry.get("method","manual").capitalize()
+        method = entry.get("method", "manual").capitalize()
         category = entry.get("category", "N/A").capitalize()
         resolution = entry.get("resolution", "N/A")
         year = entry.get("year", "")
@@ -1471,8 +1470,9 @@ async def show_history_page(event, offset=0, detail_eid=None):
         title_display = entry.get('title', Path(name).stem)
         if year and category.lower() == 'movie':
             title_display += f" ({year})"
-        elif season and episode and category.lower() != 'movie': # Check if category is not movie
-            title_display += f" - S{season:02d}E{episode:02d}"
+        elif season is not None and episode is not None and category.lower() != 'movie': # Check if category is not movie and season/ep exist
+            title_display += f" - S{int(season):02d}E{int(episode):02d}"
+
 
         text = f"📜 **History Item Details**\n\n" \
                f"🎬 **Title:** `{title_display}`\n" \
@@ -1482,46 +1482,49 @@ async def show_history_page(event, offset=0, detail_eid=None):
         if resolution and resolution != "N/A":
              text += f"📺 **Resolution:** `{resolution}`\n"
         text += f"🕓 **Time:** _{ts}_"
+
         buttons = [
             [Button.inline(f"🔁 Reorganize", f"reorg:{detail_eid}"),
              Button.inline(f"🗑️ Delete Entry", f"delorg:{detail_eid}")],
-            # Pass the original list offset back to the hist_page callback
             [Button.inline(f"◀️ Back to History (Page {(offset // entries_per_page) + 1})", f"hist_page:{offset}")]
-         ]
+        ]
         
         try:
+            # This view is typically reached via a CallbackQuery, so event.edit() is appropriate.
             await event.edit(text, buttons=buttons, parse_mode="markdown")
-        except Exception: # Fallback if edit fails (e.g. message too old, or not callback)
-            await event.respond(text, buttons=buttons, parse_mode="markdown")
+        except Exception as e:
+            logger.error(f"Error editing history detail view: {e}")
+            await event.answer("Error displaying details. Please try again.", alert=True)
 
     # --- LIST VIEW ---
     else:
-        # Handle potential empty page if entries were deleted
-        if offset >= total_entries and offset > 0: # If current offset is beyond available entries
+        if offset >= total_entries and offset > 0:
             offset = max(0, total_entries - entries_per_page) 
-            if offset < 0: offset = 0 # Ensure offset is not negative if total_entries < entries_per_page
+            if offset < 0: offset = 0
 
         page_entries = all_sorted[offset : offset + entries_per_page]
 
-        # If, after adjustment, the current page is still empty but there is data, try to go to the last valid page
-        if not page_entries and total_entries > 0: 
+        if not page_entries and total_entries > 0:
              offset = max(0, total_entries - entries_per_page)
              if offset < 0: offset = 0
              page_entries = all_sorted[offset : offset + entries_per_page]
-        elif not page_entries and total_entries == 0: # No entries at all
-             msg_text = "📁 No history available."
-             if hasattr(event, 'edit') and event.message: # Check if event.message exists for edit
-                await event.edit(msg_text, buttons=None)
-             else: 
-                await event.respond(msg_text)
+        elif not page_entries and total_entries == 0:
+             message_text = "📁 No history available."
+             if isinstance(event, events.CallbackQuery.Event):
+                try:
+                    await event.edit(message_text, buttons=None)
+                except Exception as e:
+                    logger.error(f"Error editing to 'No history': {e}")
+                    await event.answer("No history available.") # Answer callback
+             elif isinstance(event, events.NewMessage.Event):
+                await event.respond(message_text)
              return
 
         current_page_num = (offset // entries_per_page) + 1
         total_pages = (total_entries + entries_per_page - 1) // entries_per_page
-        if total_pages == 0 and total_entries > 0 : total_pages = 1 # Ensure total_pages is at least 1 if there are entries
+        if total_pages == 0 and total_entries > 0 : total_pages = 1
 
         message_text = f"📜 **History - Page {current_page_num} of {total_pages}** ({total_entries} total entries)\n\n"
-        
         action_buttons_rows = []
 
         for i, entry in enumerate(page_entries):
@@ -1531,17 +1534,14 @@ async def show_history_page(event, offset=0, detail_eid=None):
             eid = entry.doc_id
             
             title = entry.get('title', Path(name).stem)
-            # Shorten filename if too long for display line
             display_name = title if len(title) < 35 else title[:32] + "..."
 
             message_text += f"**{offset + i + 1}.** `{display_name}`\n" \
                             f"   └─ _{ts}_ `[{method}]`\n"
-            # Button to view details for this item. Pass current offset for "back" navigation.
             action_buttons_rows.append(
                 [Button.inline(f"🔍 Details for #{offset + i + 1}", f"hist_detail:{eid}:{offset}")]
             )
 
-        # Navigation buttons
         nav_row = []
         if offset > 0:
             nav_row.append(Button.inline("◀️ Prev", f"hist_page:{max(0, offset - entries_per_page)}"))
@@ -1551,20 +1551,26 @@ async def show_history_page(event, offset=0, detail_eid=None):
         if nav_row:
             action_buttons_rows.append(nav_row)
 
-        # Send or Edit the message
-        if hasattr(event, 'edit') and event.message: # Check if event.message exists for edit
+        # Send or Edit the message based on the event type
+        if isinstance(event, events.CallbackQuery.Event):
             try:
-                # Only edit if the content is different or buttons are different
-                # This simple check might not be perfect for button differences
-                if event.message.text != message_text or event.message.buttons != action_buttons_rows:
-                    await event.edit(message_text, buttons=action_buttons_rows, parse_mode="markdown")
-            except Exception: 
-                # Fallback if edit fails for other reasons, or if it's already a history message and not a CallbackQuery from a different source
-                # A more robust check might be needed if event source varies significantly
-                if not event.message.text.startswith("📜 **History"):
-                     await event.respond(message_text, buttons=action_buttons_rows, parse_mode="markdown")
-        else: # For /history command itself (NewMessage event) or if edit is not applicable
+                await event.edit(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+            except Exception as e:
+                # Handle "message is not modified" error specifically if needed, or log others
+                if "Message actual text is empty" in str(e) or "message to edit not found" in str(e): # Example specific error checks
+                    logger.warning(f"Attempted to edit but failed (possibly deleted message or bad state): {e}")
+                    # May need to send a new message if edit context is lost, but be careful.
+                    # For now, just answer the callback.
+                    await event.answer("Could not update view. Please try /history again.", alert=True)
+                elif "message not modified" not in str(e).lower(): # Don't log "not modified" as an error
+                    logger.error(f"Error editing history list view: {e}")
+                    await event.answer("Error updating list.", alert=True)
+                else:
+                    await event.answer() # Acknowledge if not modified
+        elif isinstance(event, events.NewMessage.Event):
             await event.respond(message_text, buttons=action_buttons_rows, parse_mode="markdown")
+        else:
+            logger.warning(f"show_history_page called with unexpected event type: {type(event)}")
 
 @client.on(events.CallbackQuery(pattern=r'reorg:(\d+)'))
 async def reorganize_entry(event):
