@@ -24,7 +24,44 @@ from organizer import InteractiveOrganizer
 from utils import similarity
 
 
+
 logger = logging.getLogger(__name__)
+
+def sanitize_path_component(name: str) -> str:
+    """
+    Sanitize a path component (file or directory name) for cross-platform compatibility.
+    Handles both Windows and Linux/Unix systems.
+    
+    Windows invalid characters: < > : " / \ | ? *
+    Linux/Unix: only / and null byte are invalid, but we sanitize more for consistency
+    """
+    import platform
+    
+    # Always replace forward slash (invalid on all systems when used in filename)
+    name = name.replace('/', '_')
+    
+    # Replace colon with space-dash for readability (Windows restriction, but safe everywhere)
+    name = name.replace(':', ' -')
+    
+    # Replace other potentially problematic characters
+    # These are invalid on Windows and can cause issues on some filesystems
+    invalid_chars = '<>"|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    
+    # Backslash handling: invalid on Windows, but valid on Linux
+    # Replace it for consistency across platforms
+    name = name.replace('\\', '_')
+    
+    # Remove leading/trailing spaces and dots
+    # Windows doesn't allow these, and they can be problematic on other systems too
+    name = name.strip('. ')
+    
+    # Ensure the name is not empty after sanitization
+    if not name:
+        name = 'unnamed'
+    
+    return name
 
 # Create a local organizer instance for auto-organization
 organizer = InteractiveOrganizer()
@@ -371,7 +408,7 @@ class DownloadTask:
                 dest = target_dir / Path(self.download_path).name
                 shutil.move(self.download_path, str(dest))
                 # Log low‑confidence cases
-                with open(os.path.join(BASE_DIR, 'low_confidence_log.csv'), 'a') as lf:
+                with open(BASE_DIR / 'low_confidence_log.csv', 'a') as lf:
                     lf.write(f"{self.filename},{parsed},{tmdb_title},{score:.2f}\n")
                 return
 
@@ -386,16 +423,16 @@ class DownloadTask:
                 # 2a) Anime goes under Anime/<Title>
                 if result.get('is_anime'):
                     if result['type'] == 'tv':
-                        show  = result['title']
+                        show  = sanitize_path_component(result['title'])
                         season = result['season']
                         target_dir = ANIME_DIR / show / f"Season {season:02d}"
                     elif result['type'] == 'movie':
-                        title = result['title']
+                        title = sanitize_path_component(result['title'])
                         year  = result.get('year', '')
                         folder = f"{title} ({year})" if year else title
                         target_dir = ANIME_DIR / folder
                     else:
-                        target_dir = ANIME_DIR / result['title']
+                        target_dir = ANIME_DIR / sanitize_path_component(result['title'])
 
                     target_dir.mkdir(parents=True, exist_ok=True)
                     await self.update_processing_message(
@@ -403,7 +440,7 @@ class DownloadTask:
                         f"Created directory: {target_dir}")
                 # 2b) TV shows
                 elif result['type'] == 'tv':
-                    show_name   = result['title']
+                    show_name   = sanitize_path_component(result['title'])
                     season_no   = result['season']
                     episode_no  = result['episode']
                     folder_struct = result.get('folder_structure')
@@ -420,7 +457,7 @@ class DownloadTask:
 
                 # 2c) Movies
                 elif result['type'] == 'movie':
-                    title    = result['title']
+                    title    = sanitize_path_component(result['title'])
                     year     = result.get('year', '')
                     folder_name = f"{title} ({year})" if year else title
 
@@ -459,7 +496,7 @@ class DownloadTask:
                     year = result.get('year', '')
                     base = f"{result['title']} ({year})"
                 else:
-                    base = os.path.splitext(self.filename)[0]
+                    base = Path(self.filename).stem
 
                 # --- Add resolution tag from filename ---
                 resolution = guessit(orig_name).get('screen_size', '').lower()
@@ -479,8 +516,9 @@ class DownloadTask:
             final_name = Path(self.download_path).name
             dest_path: Path = target_dir / final_name
             if dest_path.exists():
-                base, ext = os.path.splitext(dest_path)
-                dest_path = f"{base}_{int(time.time())}{ext}"
+                base = dest_path.stem
+                ext = dest_path.suffix
+                dest_path = dest_path.parent / f"{base}_{int(time.time())}{ext}"
             logger.info(f"Moving final file → {self.download_path} → {dest_path}")
             shutil.move(self.download_path, str(dest_path))
 
