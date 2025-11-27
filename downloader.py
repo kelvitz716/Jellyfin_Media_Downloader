@@ -1,0 +1,556 @@
+import asyncio
+import time
+import logging
+import mimetypes
+import shutil
+import os
+import re
+from pathlib import Path
+from datetime import timedelta
+
+import humanize
+from async_timeout import timeout
+from telethon import Button
+from guessit import guessit
+
+from config import (
+    DOWNLOAD_DIR, MAX_DOWNLOAD_DURATION, TMDB_API_KEY,
+    LOW_CONFIDENCE, HIGH_CONFIDENCE,
+    MOVIES_DIR, TV_DIR, ANIME_DIR, OTHER_DIR, BASE_DIR
+)
+from stats import BotStats
+from media_processor import MediaProcessor
+from organizer import InteractiveOrganizer
+from utils import similarity
+
+
+logger = logging.getLogger(__name__)
+
+# Create a local organizer instance for auto-organization
+organizer = InteractiveOrganizer()
+
+class DownloadManager:
+    def __init__(self, max_concurrent=3):
+        self.active_downloads = {}  # message_id: DownloadTask
+        self.queued_downloads = []  # list of DownloadTask
+        self.max_concurrent = max_concurrent
+        self.lock = asyncio.Lock()
+        self.accepting_new_downloads = True
+
+    async def add_download(self, task):
+        # Check if accepting new downloads
+        if not self.accepting_new_downloads:
+            await task.event.respond("⚠️ Bot is currently shutting down and not accepting new downloads.")
+            logger.info("Not accepting new downloads at the moment.")
+            return -1
+        
+        async with self.lock:
+            if len(self.active_downloads) < self.max_concurrent:
+                self.active_downloads[task.message_id] = task
+                # Update peak concurrent stats (using global stats for now)
+                BotStats.global_stats.update_peak_concurrent(len(self.active_downloads))
+                asyncio.create_task(self._process_download(task))
+                return 0  # Started immediately
+            else:
+                self.queued_downloads.append(task)
+                return len(self.queued_downloads)  # Position in queue
+
+    async def _process_download(self, task):
+        # Notify if coming from queue
+        if task.queue_position and task.queue_position > 0:
+            await task.event.respond(
+                f"✅ Your queue position is now 0 — download is starting!"
+            )
+
+        try:
+            await task.start_download()
+            # Process the downloaded file
+            await task.process_media()
+        except Exception as e:
+            logger.error(f"Error processing download: {e}")
+        finally:
+            # Remove from active downloads and process next in queue
+            async with self.lock:
+                if task.message_id in self.active_downloads:
+                    del self.active_downloads[task.message_id]
+
+                if self.queued_downloads:
+                    next_task = self.queued_downloads.pop(0)
+                    self.active_downloads[next_task.message_id] = next_task
+                    BotStats.global_stats.update_peak_concurrent(len(self.active_downloads))
+                    asyncio.create_task(self._process_download(next_task))
+
+    async def cancel_download(self, message_id):
+        async with self.lock:
+            # 1) Active download cancellation
+            if message_id in self.active_downloads:
+                task = self.active_downloads.pop(message_id)
+                await task.cancel()
+
+                # Immediately start the next queued task, if any
+                if self.queued_downloads:
+                    next_task = self.queued_downloads.pop(0)
+                    self.active_downloads[next_task.message_id] = next_task
+                    BotStats.global_stats.update_peak_concurrent(len(self.active_downloads))
+                    asyncio.create_task(self._process_download(next_task))
+
+                return True
+
+            # 2) Remove from queue if pending
+            for idx, task in enumerate(self.queued_downloads):
+                if task.message_id == message_id:
+                    self.queued_downloads.pop(idx)
+                    await task.cancel()
+                    return True
+
+            return False
+
+    def get_queue_status(self):
+        return {
+            "active": [(task.message_id, task.filename, task.progress)
+                      for task in self.active_downloads.values()],
+            "queued": [(i+1, task.message_id, task.filename, task.file_size)
+                      for i, task in enumerate(self.queued_downloads)]
+        }
+
+class DownloadTask:
+    def __init__(self, client, event, message_id, filename, file_size, download_manager, session=None):
+        self.client = client
+        self.event = event
+        self.message_id = message_id
+        self.download_path = DOWNLOAD_DIR / filename
+        self.ext = self.get_file_extension(filename)
+        self.filename = filename if filename.endswith(self.ext) else f"{filename}{self.ext}"
+        self.file_size = file_size
+        self.start_time = None
+        self.end_time = None
+        self.progress = 0
+        self.downloaded_bytes = 0
+        self.current_speed = 0
+        self.cancelled = False
+        self.status_message = None
+        self.process_message = None
+        # Identify large files upfront
+        self.large_file = file_size > 500 * 1024 * 1024  # > 500 MB
+        self.max_duration = MAX_DOWNLOAD_DURATION
+        self.download_manager = download_manager
+        self.queue_position = None
+        self.last_update_time = None
+        self.last_progress = 0
+        self.session = session # aiohttp session
+        
+        logger.info(f"File {filename} size: {humanize.naturalsize(file_size)}, classified as {'large' if self.large_file else 'regular'} file")
+
+    def get_file_extension(self, filename):
+        """
+        Determine a file extension:
+         1) Prefer the filename's suffix
+         2) Fallback to mimetypes.guess_extension
+         3) Default to .bin
+        """
+        # 1) Prefer the original suffix if present
+        suffix = Path(filename).suffix
+        if suffix:
+            return suffix
+
+        # 2) Fallback to mimetypes
+        guessed_mime, _ = mimetypes.guess_type(filename)
+        if guessed_mime:
+            ext = mimetypes.guess_extension(guessed_mime)
+            if ext:
+                return ext
+
+        # 3) Ultimate fallback
+        return '.bin'
+
+    async def start_download(self):
+        self.start_time = time.time()
+
+        try:
+            # Update the message to indicate download is starting
+            file_type_indicator = "📦 LARGE FILE" if self.large_file else "📄 Document"
+            update_interval = "1 minute" if self.large_file else "15 seconds"
+            
+            await self.update_queue_message(
+                f"📂 File detected: {self.filename}\n"
+                f"{file_type_indicator}\n"
+                f"📁 Will be downloaded in: {DOWNLOAD_DIR}\n"
+                f"⏳ Download is starting now.....\n"
+                f"ℹ️ Status updates every {update_interval}"
+            )
+
+            # Start the download, but enforce a max-duration
+            try:
+                async with timeout(self.max_duration):
+                    await self.client.download_media(
+                        self.event.message,
+                        self.download_path,
+                        progress_callback=self.progress_callback
+                    )
+            except asyncio.TimeoutError:
+                # Auto-cancel on timeout
+                reason = humanize.precisedelta(timedelta(seconds=self.max_duration))
+                logger.warning(f"Download {self.filename} timed out after {reason}")
+                await self.event.respond(
+                    f"⚠️ Download timed out after {reason}. Cancelling automatically."
+                )
+                await self.cancel()
+                BotStats.record_download(self.event.sender_id, 0, 0, success=False)
+                return False
+
+            if not self.cancelled:                
+                # Record completion time & stats
+                self.end_time = time.time()
+                duration = self.end_time - self.start_time
+                BotStats.record_download(self.event.sender_id, self.file_size, duration, success=True)
+
+                # Send completion message
+                await self.send_completion_message(duration)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Download error for {self.filename}: {e}")
+            await self.event.respond(f"⚠️ Download failed for {self.filename}: {str(e)}")
+            BotStats.record_download(self.event.sender_id, 0, 0, success=False)
+            return False
+
+    async def progress_callback(self, current, total):
+        if self.cancelled:
+            raise asyncio.CancelledError("Download was cancelled")
+
+        self.downloaded_bytes = current
+        self.progress = (current / total) * 100
+
+        # Calculate current speed
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        self.current_speed = current / elapsed if elapsed > 0 else 0
+
+        # For the first progress update, always send a message
+        if not hasattr(self, 'first_progress_sent') or not self.first_progress_sent:
+            self.first_progress_sent = True
+            await self.send_progress_update(current, total, elapsed)
+            self.last_update_time = current_time
+            return
+
+        # Determine if we should send a progress update
+        should_update = False
+
+        if self.large_file:
+            # For large files, update every 1 minute
+            if not self.last_update_time or current_time - self.last_update_time >= 60:  # 1 minute
+                should_update = True
+                self.last_update_time = current_time
+        else:
+            # For regular files, update every 15 seconds
+            if not self.last_update_time or current_time - self.last_update_time >= 15:  # 15 seconds
+                should_update = True
+                self.last_update_time = current_time
+
+        if should_update:
+            await self.send_progress_update(current, total, elapsed)
+
+    async def send_progress_update(self, current, total, elapsed):
+        # Calculate ETA
+        if self.current_speed > 0:
+            eta_seconds = (total - current) / self.current_speed
+            eta = str(timedelta(seconds=int(eta_seconds)))
+        else:
+            eta = "Unknown"
+
+        # Build update message
+        if self.large_file:
+            message = (
+                f"📦 STATUS UPDATE - LARGE FILE DOWNLOAD\n\n"
+                f"📂 File: {self.filename}\n"
+                f"⏱️ Running for: {humanize.precisedelta(timedelta(seconds=elapsed))}\n"
+                f"✅ Progress: {self.progress:.1f}% complete\n"
+                f"💾 Downloaded: {humanize.naturalsize(current)} of {humanize.naturalsize(total)}\n"
+                f"⚡ Current speed: {humanize.naturalsize(self.current_speed)}/s\n"
+                f"🕒 ETA: {eta} remaining\n\n"
+                f"ℹ️ Large file: Updates every minute"
+            )
+        else:
+            message = (
+                f"📄 STATUS UPDATE - Regular Download\n\n"
+                f"📂 File: {self.filename}\n"
+                f"⏱️ Running for: {humanize.precisedelta(timedelta(seconds=elapsed))}\n"
+                f"✅ Progress: {self.progress:.1f}% complete\n"
+                f"💾 Downloaded: {humanize.naturalsize(current)} of {humanize.naturalsize(total)}\n"
+                f"⚡ Current speed: {humanize.naturalsize(self.current_speed)}/s\n"
+                f"🕒 ETA: {eta} remaining"
+            )
+
+        try:
+            await self.status_message.edit(message,
+                                            buttons=[
+                                                [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                            ])
+        except Exception as e:
+            logger.error(f"Failed to update status: {e}")
+            # If edit fails, try sending a new message
+            try:
+                old_message = self.status_message
+                self.status_message = await self.event.respond(message,
+                                                                buttons=[
+                                                                    [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                                                ])
+                try:
+                    await old_message.delete()
+                except:
+                    pass
+            except Exception as inner_e:
+                logger.error(f"Failed to send new status message: {inner_e}")
+
+    async def send_completion_message(self, duration):
+        suggested_filename = f"{self.filename}{self.ext}"
+        message = (
+            f"✅ Download Complete!\n\n"
+            f"📂 File: {self.filename}\n"
+            f"📄 Suggested Filename: {suggested_filename}\n"
+            f"{'📦 Large file' if self.large_file else '📄 Regular file'}\n"
+            f"📊 Size: {humanize.naturalsize(self.file_size)}\n"
+            f"⏱️ Time: {humanize.precisedelta(timedelta(seconds=duration))}\n"
+            f"🚀 Avg Speed: {humanize.naturalsize(self.file_size / duration)}/s\n\n"
+            f"Media categorizer will start shortly."
+        )
+
+        try:
+            await self.status_message.edit(message,
+                                            buttons=[
+                                                [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                            ])
+        except Exception as e:
+            logger.error(f"Failed to send completion message: {e}")
+            try:
+                self.status_message = await self.event.respond(message)
+            except:
+                pass
+
+    async def cancel(self):
+        self.cancelled = True
+        # Delete the partially downloaded file if it exists
+        if Path(self.download_path).exists():
+            try:
+                Path(self.download_path).unlink()
+            except Exception as e:
+                logger.error(f"Failed to remove file during cancellation: {e}")
+
+        await self.event.respond(
+            f"⚠️ Cancellation requested for {self.filename}\n"
+            f"❌ Download cancelled for {self.filename}\n"
+            f"🗑️ Removed from queue"
+        )
+        return True
+
+    async def process_media(self):
+        if self.cancelled:
+            return
+
+        self.process_message = await self.event.respond(f"ℹ️ 📝 Started processing: {self.filename}")
+        try:
+            # Step 1: Analyze file using MediaProcessor
+            await self.update_processing_message("Analyzing")
+            processor = MediaProcessor(self.filename, TMDB_API_KEY, session=self.session)
+            result = await processor.search_tmdb()
+            logger.info("search_tmdb result → %s", result)
+
+            # ─── Fuzzy‑match check ────────────────────────────────────────────────
+            parsed     = guessit(self.filename).get('title', '')
+            tmdb_title = result.get('title', '')
+            score      = similarity(parsed, tmdb_title)
+            logger.info("Fuzzy match '%s' vs. '%s' → %.2f", parsed, tmdb_title, score)
+
+            if score < LOW_CONFIDENCE:
+                # Low confidence → fallback to Other
+                target_dir = OTHER_DIR
+                await self.update_processing_message(
+                    f"⚠️ Low confidence match ({score:.2f}); defaulting to OTHER"
+                )
+                # Move without renaming
+                dest = target_dir / Path(self.download_path).name
+                shutil.move(self.download_path, str(dest))
+                # Log low‑confidence cases
+                with open(os.path.join(BASE_DIR, 'low_confidence_log.csv'), 'a') as lf:
+                    lf.write(f"{self.filename},{parsed},{tmdb_title},{score:.2f}\n")
+                return
+
+            elif score < HIGH_CONFIDENCE:
+                # Medium confidence → proceed but warn
+                await self.update_processing_message(
+                    f"⚠️ Medium confidence ({score:.2f}); proceeding with caution"
+                )
+            
+            # Step 2: Decide where to put it
+            if result:
+                # 2a) Anime goes under Anime/<Title>
+                if result.get('is_anime'):
+                    if result['type'] == 'tv':
+                        show  = result['title']
+                        season = result['season']
+                        target_dir = ANIME_DIR / show / f"Season {season:02d}"
+                    elif result['type'] == 'movie':
+                        title = result['title']
+                        year  = result.get('year', '')
+                        folder = f"{title} ({year})" if year else title
+                        target_dir = ANIME_DIR / folder
+                    else:
+                        target_dir = ANIME_DIR / result['title']
+
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    await self.update_processing_message(
+                        f"✅ Anime detected: {result['title']}\n"
+                        f"Created directory: {target_dir}")
+                # 2b) TV shows
+                elif result['type'] == 'tv':
+                    show_name   = result['title']
+                    season_no   = result['season']
+                    episode_no  = result['episode']
+                    folder_struct = result.get('folder_structure')
+
+                    if folder_struct:
+                        target_dir = TV_DIR / folder_struct
+                    else:
+                        target_dir = TV_DIR / show_name / f"Season {season_no:02d}"
+
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    await self.update_processing_message(
+                        f"✅ TV: {show_name} S{season_no:02d}E{episode_no:02d}"
+                    )
+
+                # 2c) Movies
+                elif result['type'] == 'movie':
+                    title    = result['title']
+                    year     = result.get('year', '')
+                    folder_name = f"{title} ({year})" if year else title
+
+                    target_dir = MOVIES_DIR / folder_name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    await self.update_processing_message(
+                        f"✅ Movie: {title} {f'({year})' if year else ''}"
+                    )
+
+                # 2d) Fallback
+                else:
+                    target_dir = OTHER_DIR
+                    await self.update_processing_message(
+                        "⚠️ Could not identify media type; defaulting to OTHER"
+                    )
+            else:
+                target_dir = OTHER_DIR
+                await self.update_processing_message(
+                    "⚠️ No TMDb match found; defaulting to OTHER"
+                )
+
+
+            # ─── Rename for high‑confidence matches ───────────────────────────────
+            if score >= HIGH_CONFIDENCE:
+                # 1) Prepare ext & base name
+                orig_name = Path(self.download_path).name
+                ext       = Path(self.download_path).suffix
+                # Build Jellyfin‑friendly base name
+                if result.get('is_anime') and result.get('type') == 'tv':
+                    base = f"{result['title']} - Episode {result.get('episode', '')}"
+                elif result.get('type') == 'tv':
+                    season  = result.get('season', 0)
+                    episode = result.get('episode', 0)
+                    base = f"{result['title']} - S{season:02d}E{episode:02d}"
+                elif result.get('type') == 'movie':
+                    year = result.get('year', '')
+                    base = f"{result['title']} ({year})"
+                else:
+                    base = os.path.splitext(self.filename)[0]
+
+                # --- Add resolution tag from filename ---
+                resolution = guessit(orig_name).get('screen_size', '').lower()
+                if resolution:
+                    base = f"{base} [{resolution}]"
+
+                # Sanitize file name
+                safe_base   = re.sub(r'[\\/:"*?<>|]+', '', base)
+                new_name_str = f"{safe_base}{ext}"
+                new_path     = Path(self.download_path).with_name(new_name_str)
+                logger.info(f"Renaming for TMDb → {self.download_path} → {new_path}")
+                os.rename(self.download_path, new_path)
+                self.download_path = str(new_path)
+
+            # Step 3: Move file into its final library folder
+            await self.update_processing_message("Moving to library")
+            final_name = Path(self.download_path).name
+            dest_path: Path = target_dir / final_name
+            if dest_path.exists():
+                base, ext = os.path.splitext(dest_path)
+                dest_path = f"{base}_{int(time.time())}{ext}"
+            logger.info(f"Moving final file → {self.download_path} → {dest_path}")
+            shutil.move(self.download_path, str(dest_path))
+
+            # Record automatic organization
+            try:
+                organizer.record_organized({
+                    "path": str(dest_path),
+                    "title": result.get("title", Path(dest_path).stem),
+                    "category": result.get("type", "unknown"),
+                    "year": result.get("year"),
+                    "season": result.get("season"),
+                    "episode": result.get("episode"),
+                    "resolution": guessit(Path(dest_path).name).get("screen_size",""),
+                    "organized_by": self.event.sender_id,
+                    "method": "auto",
+                })
+            except Exception as e:
+                logger.error(f"Failed to record auto-organize: {e}")
+
+            processing_time = time.time() - self.end_time
+            await self.update_processing_message(
+                f"✅ Processed {final_name} in {processing_time:.1f}s\nMoved to: {dest_path}",
+                final=True
+            )
+
+        except Exception as e:
+            logger.error(f"Error processing media: {e}")
+            await self.update_processing_message(
+                f"❌ Error: {e}\nThe file remains in the download directory.",
+                error=True
+            )
+
+    async def update_processing_message(self, stage, final=False, error=False):
+        """Updates the processing message with the current stage."""
+        if not self.process_message:
+            return
+
+        if error:
+            message = f"ℹ️ 📝 Started processing: {self.filename}\n\n⚠️ {stage}"
+        else:
+            stage_symbol = "✅" if final else "🔄"
+            message = f"ℹ️ 📝 Started processing: {self.filename}\n\n{stage_symbol} Stage: {stage}"
+
+        try:
+            await self.process_message.edit(message)
+        except Exception as e:
+            logger.error(f"Failed to update processing message: {e}")
+
+    async def update_queue_message(self, message):
+        """Updates the queue message with the current status."""
+        if not self.status_message:
+            self.status_message = await self.event.respond(message)
+            return
+            
+        try:
+            await self.status_message.edit(message,
+                                            buttons=[
+                                                [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                            ])
+        except Exception as e:
+            logger.error(f"Failed to update queue message: {e}")
+            if "Content of the message was not modified" in str(e):
+                pass
+            else:
+                try:
+                    old_message = self.status_message
+                    self.status_message = await self.event.respond(message)
+                    try:
+                        await old_message.delete()
+                    except:
+                        pass
+                except Exception as inner_e:
+                    logger.error(f"Failed to send new queue message: {inner_e}")
