@@ -971,8 +971,9 @@ async def main():
     # Register event handlers
     # (Handlers are already registered via decorators above)
     
-    # Add the media handler (which doesn't have a decorator)
-    client.add_event_handler(handle_media, events.NewMessage)
+    # FIX: Do NOT manually register handle_media - it's already called by organize_flow
+    # This was causing duplicate downloads (same file downloaded twice in parallel)
+    # client.add_event_handler(handle_media, events.NewMessage)
     
     # Run until disconnected
     await client.run_until_disconnected()
