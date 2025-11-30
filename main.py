@@ -895,7 +895,13 @@ async def handle_media(event):
         return
 
     # Create download task
-    task = DownloadTask(client, event, event.message.id, filename, file_size, download_manager)
+    try:
+        task = DownloadTask(client, event, event.message.id, filename, file_size, download_manager)
+    except ValueError as e:
+        # Path traversal or other security issue detected
+        await event.respond(f"🚫 Security Error: Invalid filename. {str(e)}")
+        logger.error(f"Rejected malicious filename from user {event.sender_id}: {filename}")
+        return
     
     # Add to manager
     position = await download_manager.add_download(task)

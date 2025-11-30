@@ -155,9 +155,25 @@ class DownloadTask:
         self.client = client
         self.event = event
         self.message_id = message_id
-        self.download_path = DOWNLOAD_DIR / filename
-        self.ext = self.get_file_extension(filename)
-        self.filename = filename if filename.endswith(self.ext) else f"{filename}{self.ext}"
+        
+        # SECURITY: Sanitize filename to prevent path traversal attacks
+        from utils import sanitize_filename, validate_path_within_base
+        safe_filename = sanitize_filename(filename)
+        
+        # Log if filename was modified for security
+        if safe_filename != filename:
+            logger.warning(f"Filename sanitized: '{filename}' -> '{safe_filename}'")
+        
+        self.download_path = DOWNLOAD_DIR / safe_filename
+        
+        # SECURITY: Validate that resolved path is within DOWNLOAD_DIR
+        if not validate_path_within_base(self.download_path, DOWNLOAD_DIR):
+            error_msg = f"Security: Path traversal attempt blocked for file: {filename}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
+        self.ext = self.get_file_extension(safe_filename)
+        self.filename = safe_filename if safe_filename.endswith(self.ext) else f"{safe_filename}{self.ext}"
         self.file_size = file_size
         self.start_time = None
         self.end_time = None
@@ -176,7 +192,8 @@ class DownloadTask:
         self.last_progress = 0
         self.session = session # aiohttp session
         
-        logger.info(f"File {filename} size: {humanize.naturalsize(file_size)}, classified as {'large' if self.large_file else 'regular'} file")
+        logger.info(f"File {safe_filename} size: {humanize.naturalsize(file_size)}, classified as {'large' if self.large_file else 'regular'} file")
+
 
     def get_file_extension(self, filename):
         """
