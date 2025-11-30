@@ -55,3 +55,14 @@ data/jellyfin/
 /wheels/
 /*.tar
 /wheels
+
+# Performance test results (temporary - regenerated on each run)
+import_times.txt
+startup_profile.txt
+startup_timeline.txt
+performance_test_summary.json
+live_bot_performance.json
+performance_baseline.txt
+performance_e2e_results.json
+test_session.session
+test_session.session-journal
