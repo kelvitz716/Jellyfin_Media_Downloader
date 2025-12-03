@@ -22,6 +22,9 @@ from stats import BotStats
 from media_processor import MediaProcessor
 from organizer import InteractiveOrganizer
 from utils import similarity
+from ui.messages import Messages
+from ui.buttons import Buttons
+from ui.formatters import Formatters
 
 
 
@@ -77,7 +80,7 @@ class DownloadManager:
     async def add_download(self, task):
         # Check if accepting new downloads
         if not self.accepting_new_downloads:
-            await task.event.respond("⚠️ Bot is currently shutting down and not accepting new downloads.")
+            await task.event.respond(Messages.DOWNLOAD_NOT_ACCEPTING)
             logger.info("Not accepting new downloads at the moment.")
             return -1
         
@@ -95,9 +98,7 @@ class DownloadManager:
     async def _process_download(self, task):
         # Notify if coming from queue
         if task.queue_position and task.queue_position > 0:
-            await task.event.respond(
-                f"✅ Your queue position is now 0 — download is starting!"
-            )
+            await task.event.respond(Messages.QUEUE_STARTING)
 
         try:
             await task.start_download()
@@ -222,15 +223,16 @@ class DownloadTask:
 
         try:
             # Update the message to indicate download is starting
-            file_type_indicator = "📦 LARGE FILE" if self.large_file else "📄 Document"
+            file_type_indicator = Messages.MEDIA_LARGE_FILE if self.large_file else Messages.MEDIA_REGULAR_FILE
             update_interval = "1 minute" if self.large_file else "15 seconds"
             
             await self.update_queue_message(
-                f"📂 File detected: {self.filename}\n"
-                f"{file_type_indicator}\n"
-                f"📁 Will be downloaded in: {DOWNLOAD_DIR}\n"
-                f"⏳ Download is starting now.....\n"
-                f"ℹ️ Status updates every {update_interval}"
+                Messages.DOWNLOAD_INITIALIZING.format(
+                    filename=self.filename,
+                    file_type=file_type_indicator,
+                    dir=DOWNLOAD_DIR,
+                    interval=update_interval
+                )
             )
 
             # Start the download, but enforce a max-duration
@@ -246,7 +248,7 @@ class DownloadTask:
                 reason = humanize.precisedelta(timedelta(seconds=self.max_duration))
                 logger.warning(f"Download {self.filename} timed out after {reason}")
                 await self.event.respond(
-                    f"⚠️ Download timed out after {reason}. Cancelling automatically."
+                    Messages.DOWNLOAD_TIMEOUT.format(reason=reason)
                 )
                 await self.cancel()
                 BotStats.record_download(self.event.sender_id, 0, 0, success=False)
@@ -264,7 +266,7 @@ class DownloadTask:
             return False
         except Exception as e:
             logger.error(f"Download error for {self.filename}: {e}")
-            await self.event.respond(f"⚠️ Download failed for {self.filename}: {str(e)}")
+            await self.event.respond(Messages.DOWNLOAD_FAILED.format(filename=self.filename, error=str(e)))
             BotStats.record_download(self.event.sender_id, 0, 0, success=False)
             return False
 
@@ -313,32 +315,20 @@ class DownloadTask:
             eta = "Unknown"
 
         # Build update message
-        if self.large_file:
-            message = (
-                f"📦 STATUS UPDATE - LARGE FILE DOWNLOAD\n\n"
-                f"📂 File: {self.filename}\n"
-                f"⏱️ Running for: {humanize.precisedelta(timedelta(seconds=elapsed))}\n"
-                f"✅ Progress: {self.progress:.1f}% complete\n"
-                f"💾 Downloaded: {humanize.naturalsize(current)} of {humanize.naturalsize(total)}\n"
-                f"⚡ Current speed: {humanize.naturalsize(self.current_speed)}/s\n"
-                f"🕒 ETA: {eta} remaining\n\n"
-                f"ℹ️ Large file: Updates every minute"
-            )
-        else:
-            message = (
-                f"📄 STATUS UPDATE - Regular Download\n\n"
-                f"📂 File: {self.filename}\n"
-                f"⏱️ Running for: {humanize.precisedelta(timedelta(seconds=elapsed))}\n"
-                f"✅ Progress: {self.progress:.1f}% complete\n"
-                f"💾 Downloaded: {humanize.naturalsize(current)} of {humanize.naturalsize(total)}\n"
-                f"⚡ Current speed: {humanize.naturalsize(self.current_speed)}/s\n"
-                f"🕒 ETA: {eta} remaining"
-            )
+        message = Formatters.format_download_progress(
+            filename=self.filename,
+            is_large=self.large_file,
+            elapsed=humanize.precisedelta(timedelta(seconds=elapsed)),
+            progress=self.progress,
+            downloaded=f"{humanize.naturalsize(current)} of {humanize.naturalsize(total)}",
+            speed=f"{humanize.naturalsize(self.current_speed)}/s",
+            eta=eta
+        )
 
         try:
             await self.status_message.edit(message,
                                             buttons=[
-                                                [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                                [ Buttons.cancel_download(self.message_id) ]
                                             ])
         except Exception as e:
             logger.error(f"Failed to update status: {e}")
@@ -347,7 +337,7 @@ class DownloadTask:
                 old_message = self.status_message
                 self.status_message = await self.event.respond(message,
                                                                 buttons=[
-                                                                    [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                                                    [ Buttons.cancel_download(self.message_id) ]
                                                                 ])
                 try:
                     await old_message.delete()
@@ -358,21 +348,19 @@ class DownloadTask:
 
     async def send_completion_message(self, duration):
         suggested_filename = f"{self.filename}{self.ext}"
-        message = (
-            f"✅ Download Complete!\n\n"
-            f"📂 File: {self.filename}\n"
-            f"📄 Suggested Filename: {suggested_filename}\n"
-            f"{'📦 Large file' if self.large_file else '📄 Regular file'}\n"
-            f"📊 Size: {humanize.naturalsize(self.file_size)}\n"
-            f"⏱️ Time: {humanize.precisedelta(timedelta(seconds=duration))}\n"
-            f"🚀 Avg Speed: {humanize.naturalsize(self.file_size / duration)}/s\n\n"
-            f"Media categorizer will start shortly."
+        message = Formatters.format_download_complete(
+            filename=self.filename,
+            suggested_filename=suggested_filename,
+            is_large=self.large_file,
+            size=humanize.naturalsize(self.file_size),
+            duration=humanize.precisedelta(timedelta(seconds=duration)),
+            speed=f"{humanize.naturalsize(self.file_size / duration)}/s"
         )
 
         try:
             await self.status_message.edit(message,
                                             buttons=[
-                                                [ Button.inline("❌ Cancel download", f"cancel_{self.message_id}") ]
+                                                [ Buttons.cancel_download(self.message_id) ]
                                             ])
         except Exception as e:
             logger.error(f"Failed to send completion message: {e}")
@@ -391,9 +379,7 @@ class DownloadTask:
                 logger.error(f"Failed to remove file during cancellation: {e}")
 
         await self.event.respond(
-            f"⚠️ Cancellation requested for {self.filename}\n"
-            f"❌ Download cancelled for {self.filename}\n"
-            f"🗑️ Removed from queue"
+            Messages.DOWNLOAD_CANCELLED_FULL.format(filename=self.filename)
         )
         return True
 
@@ -401,10 +387,12 @@ class DownloadTask:
         if self.cancelled:
             return
 
-        self.process_message = await self.event.respond(f"ℹ️ 📝 Started processing: {self.filename}")
+        self.process_message = await self.event.respond(
+            Messages.PROCESSING_STARTED.format(filename=self.filename)
+        )
         try:
             # Step 1: Analyze file using MediaProcessor
-            await self.update_processing_message("Analyzing")
+            await self.update_processing_message(Messages.STAGE_ANALYZING)
             processor = MediaProcessor(self.filename, TMDB_API_KEY, session=self.session)
             result = await processor.search_tmdb()
             logger.info("search_tmdb result → %s", result)
@@ -529,7 +517,7 @@ class DownloadTask:
                 self.download_path = str(new_path)
 
             # Step 3: Move file into its final library folder
-            await self.update_processing_message("Moving to library")
+            await self.update_processing_message(Messages.STAGE_MOVING)
             final_name = Path(self.download_path).name
             dest_path: Path = target_dir / final_name
             if dest_path.exists():
@@ -573,11 +561,12 @@ class DownloadTask:
         if not self.process_message:
             return
 
-        if error:
-            message = f"ℹ️ 📝 Started processing: {self.filename}\n\n⚠️ {stage}"
-        else:
-            stage_symbol = "✅" if final else "🔄"
-            message = f"ℹ️ 📝 Started processing: {self.filename}\n\n{stage_symbol} Stage: {stage}"
+        message = Formatters.format_processing_stage(
+            filename=self.filename,
+            stage=stage,
+            is_final=final,
+            is_error=error
+        )
 
         try:
             await self.process_message.edit(message)

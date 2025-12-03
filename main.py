@@ -72,28 +72,28 @@ def build_queue_message(page: int = 1, per_page: int = 10):
     active   = status["active"]    # list of (msg_id, filename, progress)
     queued   = status["queued"]    # list of (pos, msg_id, filename, size)
 
-    lines = [f"🗒️ **Download Queue (page {page})**\n"]
+    lines = [Messages.QUEUE_HEADER.format(page=page)]
 
     # Currently downloading
     if active:
-        lines.append("▶️ **Now:**")
+        lines.append(Messages.QUEUE_NOW)
         for i, (_mid, fn, prog) in enumerate(active, 1):
             filled = min(int(prog // 10), 10)
             bar    = "[" + "█"*filled + "─"*(10-filled) + f"] {prog:.0f}%"
             lines.append(f"{i}. `{fn}`  {bar}")
         lines.append("")
     else:
-        lines.append("▶️ **Now:** _idle_\n")
+        lines.append(Messages.QUEUE_NOW_IDLE)
 
     # Upcoming (paginated)
     start = (page-1)*per_page
     page_items = queued[start : start+per_page]
     if page_items:
-        lines.append("⬇️ **Up next:**")
+        lines.append(Messages.QUEUE_NEXT)
         for idx, (_pos, _mid, fn, sz) in enumerate(page_items, start+1):
             lines.append(f"{idx}. `{fn}` ({humanize.naturalsize(sz)})")
     else:
-        lines.append("✅ No more items in queue.")
+        lines.append(Messages.QUEUE_NEXT_NONE)
 
     # Build inline buttons: cancel + “More →”
     buttons = []
@@ -627,29 +627,7 @@ async def start_command(event):
         all_users.add(event.sender_id)
         save_active_users(all_users)
 
-    await event.respond(
-        "👋 Welcome to the Jellyfin Media Downloader Bot!\n\n"
-        "Send me any media file and I will download it to your Jellyfin library.\n\n"
-        "📂 COMMANDS:\n"
-        "/start      - Show this welcome message\n"
-        "/help       - Show usage help\n"
-        "/stats      - 📊 Show download statistics\n"
-        "/status     - 📊 Alias for /stats\n"
-        "/queue      - 📋 View current download queue\n"
-        "/test       - 🔍 Run system test\n"
-        "\n"
-        "🚀 Admin commands:\n"
-        "/organize   - 🗂️ Organize files into categories\n"
-        "/history    - 📜 View organize history\n"
-        "/propagate  - 📦 Bulk-propagate episodes\n"
-        "/users      - 👥 View total unique users\n"
-        "/shutdown   - 🔌 Gracefully shut down the bot\n"
-        "\n"
-        "📱 SUPPORTED FORMATS:\n"
-        "• 🎬 Videos: MP4, MKV, AVI, etc.\n"
-        "• 🎵 Audio: MP3, FLAC, WAV, etc.\n"
-        "• 📄 Documents: PDF, ZIP, etc."
-    )
+    await event.respond(Messages.HELP_TEXT)
 
 @client.on(events.NewMessage(pattern='/stats|/status'))
 async def stats_command(event):
@@ -681,42 +659,42 @@ async def stats_command(event):
         await event.respond("\n".join(lines))
         return
 
-    # Non-admin: show the existing runtime stats
-    uptime = stats.get_uptime()
-
-    # Calculate success percentage
-    if stats.files_handled > 0:
-        success_percent = (stats.successful_downloads / stats.files_handled) * 100
-    else:
-        success_percent = 0
-
-    # Get average speed in MB/s
+    # Non-admin: show the new themed stats
+    uptime_seconds = stats.get_uptime()
+    uptime_str = Formatters.duration(uptime_seconds)
+    
+    # Get average speed
     avg_speed = stats.get_average_speed()
-    avg_speed_str = humanize.naturalsize(avg_speed) + "/s" if avg_speed > 0 else "N/A"
-
+    avg_speed_str = Formatters.speed(avg_speed) if avg_speed > 0 else "N/A"
+    
     # Get average time per file
     avg_time = stats.get_average_time()
-    avg_time_str = humanize.precisedelta(timedelta(seconds=avg_time)) if avg_time > 0 else "N/A"
-
+    avg_time_str = Formatters.duration(avg_time) if avg_time > 0 else "N/A"
+    
+    # Format total data
+    total_data_str = Formatters.file_size(stats.total_data)
+    
     # Get queue info
     queue_status = download_manager.get_queue_status()
     active_count = len(queue_status["active"])
     queued_count = len(queue_status["queued"])
-
-    await event.respond(
-        "📊 DOWNLOAD STATISTICS\n\n"
-        f"📆 Bot uptime: {humanize.precisedelta(uptime)}\n"
-        f"📥 Files handled: {stats.files_handled}\n\n"
-        f"DOWNLOADS:\n"
-        f"✅ Successful: {stats.successful_downloads} ({success_percent:.1f}%)\n"
-        f"❌ Failed: {stats.failed_downloads} ({100-success_percent:.1f}%)\n"
-        f"💾 Total data: {humanize.naturalsize(stats.total_data)}\n\n"
-        f"PERFORMANCE:\n"
-        f"⚡ Average speed: {avg_speed_str}\n"
-        f"⏱️ Avg time per file: {avg_time_str}\n"
-        f"📊 Peak concurrent downloads: {stats.peak_concurrent}/{download_manager.max_concurrent}\n\n"
-        f"⏳ Current status: {active_count} active, {queued_count} queued"
+    
+    # Use the new formatter
+    message = Formatters.format_stats(
+        uptime=uptime_str,
+        files_handled=stats.files_handled,
+        successful=stats.successful_downloads,
+        failed=stats.failed_downloads,
+        total_data=total_data_str,
+        avg_speed=avg_speed_str,
+        avg_time=avg_time_str,
+        peak_concurrent=stats.peak_concurrent,
+        max_concurrent=download_manager.max_concurrent,
+        active_count=active_count,
+        queued_count=queued_count
     )
+    
+    await event.respond(message)
 
 @client.on(events.NewMessage(pattern=r'^/queue(?:\s+(\d+))?$'))
 async def queue_command(event):

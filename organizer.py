@@ -13,6 +13,10 @@ from config import DOWNLOAD_DIR, OTHER_DIR, MEDIA_EXTENSIONS
 from database import organized_tbl, error_log_tbl
 from utils import similarity
 
+# UI Layer
+from ui.messages import Messages
+from ui.buttons import Buttons
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,24 +57,24 @@ class InteractiveOrganizer:
             return ev.text.strip()
 
         # 1) category
-        cat = await ask("Enter category (`movie`, `tv`, or `anime`):")
+        cat = await ask(Messages.ORGANIZE_ENTER_CATEGORY)
         cat = cat.lower()
         if cat not in {"movie", "tv", "anime"}:
-            await session.respond("Invalid category, defaulting to `movie`.")
+            await session.respond(Messages.ORGANIZE_INVALID_CATEGORY)
             cat = "movie"
 
         # 2) title
-        title = await ask("Enter title:")
+        title = await ask(Messages.ORGANIZE_ENTER_TITLE)
 
         # 3) year
-        year_text = await ask("Enter year (e.g. `2021`):")
+        year_text = await ask(Messages.ORGANIZE_ENTER_YEAR)
         year = int(year_text) if year_text.isdigit() else None
 
         # 4) season/episode if needed
         season = episode = None
         if cat in {"tv", "anime"}:
-            s = await ask("Enter season number:")
-            e = await ask("Enter episode number:")
+            s = await ask(Messages.ORGANIZE_ENTER_SEASON)
+            e = await ask(Messages.ORGANIZE_ENTER_EPISODE)
             season = int(s) if s.isdigit() else None
             episode = int(e) if e.isdigit() else None
 
@@ -91,13 +95,9 @@ class InteractiveOrganizer:
 
     async def show_preview_panel(self, session, src: Path, proposed_dest: Path) -> bool:
         """Show a preview with Confirm/Amend/Discard buttons."""
-        kb = [
-            [Button.inline("✅ Confirm", b"confirm")],
-            [Button.inline("✏️ Amend",    b"amend")],
-            [Button.inline("❌ Discard",  b"discard")],
-        ]
+        kb = Buttons.preview_panel()
         msg = await session.respond(
-            f"Preview rename:\n`{src.name}` → `{proposed_dest.name}`",
+            Messages.PREVIEW_RENAME.format(src=src.name, dest=proposed_dest.name),
             buttons=kb, parse_mode="markdown"
         )
 
@@ -117,7 +117,7 @@ class InteractiveOrganizer:
             choice = session.data.pop("preview_choice", b"")
             return choice == b"confirm"
         except asyncio.TimeoutError:
-            await session.respond("⏰ Preview timed out; discarding.")
+            await session.respond(Messages.PREVIEW_TIMEOUT)
             return False
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
@@ -147,8 +147,12 @@ class InteractiveOrganizer:
         for idx, item in enumerate(items, start=1):
             await asyncio.sleep(0)  # allow cancellation
             await session.respond(
-                f"{idx}/{len(items)}  `{item['src'].name}` → `{item['dest'].name}`\n"
-                "Reply `yes` to confirm, `no` to skip."
+                Messages.PREVIEW_BULK_ITEM.format(
+                    current=idx,
+                    total=len(items),
+                    src=item['src'].name,
+                    dest=item['dest'].name
+                )
             )
 
     async def process_bulk_queue(self):
