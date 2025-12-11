@@ -19,14 +19,49 @@ _tv    = TV()
 class MediaProcessor:
     """
     Parses media filenames using GuessIt and queries TMDb for movies or TV episodes.
+    
+    Supports two usage patterns:
+    
+    1. External session (injected):
+        processor = MediaProcessor(filename, tmdb_api_key, session=existing_session)
+        result = await processor.search_tmdb()
+    
+    2. Context manager (self-managed session):
+        async with MediaProcessor(filename, tmdb_api_key) as processor:
+            result = await processor.search_tmdb()
     """
     TMDB_URL = "https://api.themoviedb.org/3"
 
     def __init__(self, filename: str, tmdb_api_key: str, session: aiohttp.ClientSession = None):
-        """Initializes the MediaProcessor with filename, TMDb API key, and optional session."""
+        """
+        Initialize MediaProcessor.
+        
+        Args:
+            filename: Media filename to parse
+            tmdb_api_key: TMDb API key
+            session: Optional aiohttp session. If not provided, one will be
+                     created when using the context manager.
+        """
         self.filename = filename
         self.tmdb_api_key = tmdb_api_key
         self.session = session
+        self._owns_session = False  # True if we created the session ourselves
+
+    async def __aenter__(self):
+        """Create session if not provided externally."""
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+            self._owns_session = True
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Close session if we created it."""
+        if self._owns_session and self.session:
+            await self.session.close()
+            self.session = None
+            self._owns_session = False
+        return False  # Don't suppress exceptions
+
 
     async def search_tmdb(self) -> dict:
         """

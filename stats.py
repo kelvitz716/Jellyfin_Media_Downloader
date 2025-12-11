@@ -1,9 +1,13 @@
+from collections import deque
 from datetime import datetime
 from tinydb import where
 from database import stats_tbl
 
 
 class BotStats:
+    # Maximum samples to keep in memory for rolling averages
+    MAX_SAMPLES = 1000
+    
     def __init__(self):
         self.start_time = datetime.now()
         self.files_handled = 0
@@ -11,8 +15,14 @@ class BotStats:
         self.failed_downloads = 0
         self.total_data = 0
         self.peak_concurrent = 0
-        self.download_times = []
-        self.download_speeds = []
+        # Bounded deques for rolling averages (prevents memory growth)
+        self.download_times = deque(maxlen=self.MAX_SAMPLES)
+        self.download_speeds = deque(maxlen=self.MAX_SAMPLES)
+        # Running totals for accurate lifetime averages
+        self._total_time = 0.0
+        self._total_speed_sum = 0.0
+        self._samples_count = 0
+
 
     global_stats = None
     user_stats = {}
@@ -63,7 +73,12 @@ class BotStats:
             self.successful_downloads += 1
             self.total_data += size
             self.download_times.append(duration)
-            self.download_speeds.append(size / duration if duration > 0 else 0)
+            speed = size / duration if duration > 0 else 0
+            self.download_speeds.append(speed)
+            # Track running totals for accurate lifetime averages
+            self._total_time += duration
+            self._total_speed_sum += speed
+            self._samples_count += 1
         else:
             self.failed_downloads += 1
 
@@ -75,9 +90,19 @@ class BotStats:
         return datetime.now() - self.start_time
 
     def get_average_speed(self):
-        return (sum(self.download_speeds) / len(self.download_speeds)) if self.download_speeds else 0
+        """Get lifetime average download speed."""
+        return (self._total_speed_sum / self._samples_count) if self._samples_count > 0 else 0
 
     def get_average_time(self):
+        """Get lifetime average download time."""
+        return (self._total_time / self._samples_count) if self._samples_count > 0 else 0
+    
+    def get_rolling_average_speed(self):
+        """Get rolling average speed (last MAX_SAMPLES downloads)."""
+        return (sum(self.download_speeds) / len(self.download_speeds)) if self.download_speeds else 0
+    
+    def get_rolling_average_time(self):
+        """Get rolling average time (last MAX_SAMPLES downloads)."""
         return (sum(self.download_times) / len(self.download_times)) if self.download_times else 0
 
 # Initialize global stats
